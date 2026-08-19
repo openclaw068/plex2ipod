@@ -76,6 +76,37 @@ created next to the .exe on first run.
 
 To rebuild the icon and logo from scratch: `python make_icon.py`.
 
+## Tests
+
+```bash
+python3 run_tests.py             # everything
+python3 run_tests.py -v          # per-test names
+python3 run_tests.py test_sync   # one module
+python3 run_tests.py --no-gui    # skip anything needing a display
+```
+
+Standard library `unittest`, no pytest — same zero-dependency rule as the
+app. Tests that need Tk are skipped automatically when there's no display,
+and the ffmpeg-dependent ones skip when ffmpeg isn't installed.
+
+| Module | Covers |
+| --- | --- |
+| `test_paths` | filename sanitizing, iPod-relative paths, sort order, volume detection |
+| `test_sync_engine` | destination layout, `.m3u` path form, sync planning, folder-name caching |
+| `test_sync` | downloading, dedup, and the rule that a `.m3u` only lists real files |
+| `test_manage` | deletion, Cancel, playlist cleanup, empty-folder tidying |
+| `test_poll` | the iPod detection heartbeat and its idle cost |
+| `test_wheel` | mouse wheel normalization across X11, Windows and macOS |
+| `test_audio` | ffmpeg/ffprobe discovery and platform-correct binary choice |
+| `test_gui` | wheel bindings, styled widgets, connect flow, Manage-tab guards |
+
+To check the suite still catches regressions, point it at an older copy of
+the app:
+
+```bash
+PLEX2IPOD_APP=/path/to/old/Plex2iPod.pyw python3 run_tests.py
+```
+
 ## On the iPod
 
 Expected layout, which is what the app writes:

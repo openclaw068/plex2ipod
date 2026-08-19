@@ -737,14 +737,29 @@ class AudioConverter:
     """Wraps bundled ffmpeg/ffprobe for FLAC downsampling."""
 
     def __init__(self):
-        self.ffmpeg_path = self._locate("ffmpeg.exe")
-        self.ffprobe_path = self._locate("ffprobe.exe")
+        self.ffmpeg_path = self._locate("ffmpeg")
+        self.ffprobe_path = self._locate("ffprobe")
+
+    @staticmethod
+    def _runnable(path):
+        """True if path is a file this OS can actually execute. On Linux a
+        bundled Windows .exe is a file but not runnable, and treating it as
+        usable makes every ffmpeg call fail at spawn time."""
+        return os.path.isfile(path) and (IS_WINDOWS or os.access(path, os.X_OK))
 
     @staticmethod
     def _locate(name):
-        """Find ffmpeg/ffprobe in the bundled 'ffmpeg' folder.
-        Returns None if not found."""
+        """Find ffmpeg/ffprobe in the bundled 'ffmpeg' folder, then on PATH.
+        Returns None if not found.
+
+        `name` is the bare tool name; the .exe suffix is applied only on
+        Windows. A checkout that carries the bundled Windows binaries — a
+        synced folder, or a repo shared between machines — must not pick
+        those on Linux and then report itself as available while every
+        conversion fails.
+        """
         import sys
+        exe = name + ".exe" if IS_WINDOWS else name
         # When frozen by PyInstaller, binaries unpack into sys._MEIPASS
         base_candidates = []
         if getattr(sys, "frozen", False):
@@ -756,16 +771,16 @@ class AudioConverter:
             base_candidates.append(os.path.dirname(os.path.abspath(__file__)))
 
         for base in base_candidates:
-            candidate = os.path.join(base, "ffmpeg", name)
-            if os.path.isfile(candidate):
+            candidate = os.path.join(base, "ffmpeg", exe)
+            if AudioConverter._runnable(candidate):
                 return candidate
             # also try flat (if user dropped them next to the exe)
-            flat = os.path.join(base, name)
-            if os.path.isfile(flat):
+            flat = os.path.join(base, exe)
+            if AudioConverter._runnable(flat):
                 return flat
         # Last resort: a system-installed ffmpeg on PATH. Lets the app
         # downsample for users who didn't get the bundled binaries.
-        on_path = shutil.which(name) or shutil.which(os.path.splitext(name)[0])
+        on_path = shutil.which(exe) or shutil.which(name)
         if on_path:
             return on_path
         return None
