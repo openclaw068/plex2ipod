@@ -2480,6 +2480,15 @@ class App:
         self._tree_loaded.clear()
         self._tree_pending_check.clear()
 
+        # The artist load normally fires from _select_tab when the user
+        # first opens the Library tab. If that tab is *already* the active
+        # one when a connection lands, no tab change happens and the tree
+        # would sit empty until the user clicked away and back. Kick it off
+        # here instead. _load_artists guards on plex/_section_id and flips
+        # _artists_loaded itself, so this can't double-load.
+        if self._active_tab.get() == 1:   # 1 = Library
+            self._load_artists()
+
     # ---- playlists tab ----
 
     def _populate_playlists(self, playlists):
