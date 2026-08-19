@@ -15,14 +15,20 @@ from .audio import AudioConverter
 from .config import CONFIG_DEFAULTS, ConfigManager
 from .naming import find_path_collisions, ipod_rel_path, sort_key
 from .paths import resource_dirs
-from .platform_io import (IS_WINDOWS, detect_ipod_roots, eject_volume,
-                          list_ipod_roots, music_folder_name)
+from .platform_io import (IS_WINDOWS, detect_ipod_roots, disk_usage,
+                          eject_volume, list_ipod_roots, music_folder_name)
 from .plexapi import (PlexClient, plex_check_pin, plex_create_pin,
                       plex_list_servers, plex_pick_connection)
 from .sync import SyncEngine
 from .theme import THEMES
 from .version import APP_VERSION
-from .widgets import GlassCard, StyledButton, StyledCheckbutton, StyledEntry
+from .widgets import (CapacityBar, GlassCard, StyledButton,
+                      StyledCheckbutton, StyledEntry)
+
+# Leave a little headroom rather than filling the volume to the last byte:
+# FAT32 needs room for directory entries, and the download writes a .part
+# sidecar before renaming it into place.
+FREE_SPACE_MARGIN = 32 * 1024 * 1024
 
 
 class App:
@@ -45,6 +51,17 @@ class App:
         self._tree_loaded = set()  # item ids whose children have been fetched
         self._tree_pending_check = set()  # items whose children should auto-check on load
         self._artists_loaded = False
+
+        # Capacity accounting. The playlist cache holds track lists fetched
+        # purely to size a selection; the iPod index is the set of relative
+        # paths already on the device, so those tracks cost no new space.
+        self._playlist_track_cache = {}
+        self._playlist_fetching = set()
+        self._ipod_index = None
+        self._indexed_root = None
+        self._capacity = None
+        self._capacity_after = None
+
         # Bumped every time the widget tree is torn down and rebuilt. Async
         # library loads carry the value they started with and drop their
         # results if it no longer matches: ttk hands out item ids like
@@ -610,6 +627,7 @@ class App:
             else:
                 self._ipod_announced = None
             self._update_ipod_status()
+            self._maybe_refresh_ipod_index()
         finally:
             self.root.after(delay, self._poll_ipod)
 
@@ -1118,12 +1136,27 @@ class App:
             except AttributeError:
                 pass
 
+        # iPod capacity: how full the device is and what the selection
+        # would add. Sits above the progress bar so the two read as one
+        # block about the sync that is about to happen.
+        self._capacity_bar = CapacityBar(bar, self.t)
+        self._capacity_bar.pack(fill="x", pady=(6, 2))
+
+        self._capacity_var = tk.StringVar(value="")
+        self._capacity_label = tk.Label(
+            bar, textvariable=self._capacity_var, bg=self.t["bg"],
+            fg=self.t["fg_dim"], font=("Segoe UI", 9), anchor="w",
+        )
+        self._capacity_label.pack(fill="x")
+
         # progress bar (canvas-drawn)
         self._progress_canvas = tk.Canvas(
             bar, height=10, highlightthickness=0, bd=0, bg=self.t["bg"],
         )
         self._progress_canvas.pack(fill="x", pady=(4, 2))
         self._progress_val = 0
+
+        self._schedule_capacity_update(delay=50)
 
     def _draw_progress(self):
         c = self._progress_canvas
@@ -1295,6 +1328,7 @@ class App:
 
         self._progress_val = state["progress"]
         self._draw_progress()
+        self._schedule_capacity_update(delay=50)
 
         # The rebuild handed us default-enabled buttons; an operation may
         # still be running underneath.
@@ -1547,6 +1581,9 @@ class App:
 
     def _on_connected(self, playlists, section_id):
         self._section_id = section_id
+        # Sizes were cached against the previous server/session.
+        self._playlist_track_cache.clear()
+        self._playlist_fetching.clear()
         count_text = f"{len(playlists)} playlists"
         self._status_var.set(f"Connected  \u2022  {count_text}")
         self._status_label.configure(fg=self.t["success"])
@@ -1581,6 +1618,9 @@ class App:
             var = tk.BooleanVar(value=False)
             smart_tag = "  \u26a1" if pl["smart"] else ""
             text = f"{pl['title']}{smart_tag}   ({pl['leaf_count']} tracks)"
+            var.trace_add(
+                "write",
+                lambda *_a, pid=pl["id"]: self._on_playlist_toggled(pid))
             cb = StyledCheckbutton(self._pl_inner, text, var, self.t)
             cb.pack(fill="x", padx=4, pady=2)
             # recurse=True so the wheel also works with the pointer over the
@@ -1659,6 +1699,7 @@ class App:
             for child in self._tree.get_children(parent_iid):
                 self._set_checked(child, True)
             self._tree_pending_check.discard(parent_iid)
+            self._schedule_capacity_update()
 
     def _load_tracks_worker(self, parent_iid, album, generation):
         try:
@@ -1687,6 +1728,7 @@ class App:
             for child in self._tree.get_children(parent_iid):
                 self._set_checked(child, True)
             self._tree_pending_check.discard(parent_iid)
+        self._schedule_capacity_update()
 
     def _on_tree_click(self, event):
         item = self._tree.identify_row(event.y)
@@ -1694,6 +1736,7 @@ class App:
             return
         new_state = not self._tree_checked[item]
         self._set_checked(item, new_state)
+        self._schedule_capacity_update()
 
     def _set_checked(self, item, state):
         self._tree_checked[item] = state
@@ -1747,10 +1790,12 @@ class App:
     def _lib_select_all(self):
         for item in self._tree.get_children():
             self._set_checked(item, True)
+        self._schedule_capacity_update()
 
     def _lib_deselect_all(self):
         for item in self._tree.get_children():
             self._set_checked(item, False)
+        self._schedule_capacity_update()
 
     # ---- Manage iPod tab ----
 
@@ -2080,6 +2125,7 @@ class App:
     def _remove_finished(self):
         self._set_busy(False)
         self._scan_ipod()
+        self._maybe_refresh_ipod_index(force=True)
 
     def _cleanup_empty_dirs(self, root_dir):
         removed = 0
@@ -2763,7 +2809,205 @@ class App:
 
         return not (has_sr and has_dur)
 
+    # ---- iPod capacity ----
+
+    def _schedule_capacity_update(self, delay=250):
+        """Recompute soon, coalescing bursts.
+
+        Ticking a whole artist fires one call per descendant, and each
+        recompute walks the selection, so the work is debounced rather
+        than done thousands of times for one click.
+        """
+        existing = getattr(self, "_capacity_after", None)
+        if existing is not None:
+            try:
+                self.root.after_cancel(existing)
+            except (tk.TclError, ValueError):
+                pass
+        try:
+            self._capacity_after = self.root.after(
+                delay, self._recompute_capacity)
+        except (tk.TclError, AttributeError):
+            self._capacity_after = None
+
+    def _track_bytes(self, track, seen):
+        """Bytes this track would add, or 0 if it is a duplicate or is
+        already on the device."""
+        rel = ipod_rel_path(track).lower()
+        if rel in seen:
+            return 0
+        seen.add(rel)
+        if self._ipod_index is not None and rel in self._ipod_index:
+            return 0
+        try:
+            return max(int(track.get("size") or 0), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _selection_bytes(self):
+        """(bytes the selection would add, whether any size is still unknown).
+
+        Sizes come from Plex, so a 24-bit FLAC queued for downsampling is
+        counted at its source size. That overestimates, which is the safe
+        direction for a capacity warning.
+        """
+        seen = set()
+        total = 0
+        pending = False
+        for pid, (var, _pl) in self._playlist_vars.items():
+            if not var.get():
+                continue
+            tracks = self._playlist_track_cache.get(pid)
+            if tracks is None:
+                pending = True
+                continue
+            for track in tracks:
+                total += self._track_bytes(track, seen)
+        for track in self._gather_library_tracks():
+            total += self._track_bytes(track, seen)
+        return total, pending
+
+    def _recompute_capacity(self):
+        self._capacity_after = None
+        if not hasattr(self, "_capacity_bar"):
+            return
+        usage = disk_usage(self._ipod_root())
+        if not usage:
+            self._capacity = None
+            self._capacity_bar.set_values(0, 0, 0)
+            self._capacity_var.set("No iPod connected")
+            self._capacity_label.configure(fg=self.t["fg_dim"])
+            return
+
+        total, used, free = usage
+        selected, pending = self._selection_bytes()
+        over = max(selected - free, 0)
+        self._capacity = {"total": total, "used": used, "free": free,
+                          "selected": selected, "over": over}
+        self._capacity_bar.set_values(total, used, selected)
+
+        text = (f"{self._human_size(used)} used  \u2022  "
+                f"{self._human_size(selected)} selected  \u2022  "
+                f"{self._human_size(free)} free of {self._human_size(total)}")
+        if pending:
+            text += "  \u2022  sizing playlists\u2026"
+        if over:
+            text += f"    \u26a0 {self._human_size(over)} over capacity"
+        self._capacity_var.set(text)
+        self._capacity_label.configure(
+            fg=self.t["error"] if over else self.t["fg_dim"])
+
+    # -- what is already on the device --
+
+    def _maybe_refresh_ipod_index(self, force=False):
+        """Index the iPod's music folder when the device changes, or after
+        an operation that altered it. Tracks already present cost no new
+        space, and without this every selection would look too big."""
+        root = self._ipod_root()
+        if not root or not os.path.isdir(root):
+            if self._ipod_index is not None or self._indexed_root:
+                self._ipod_index = None
+                self._indexed_root = None
+                self._schedule_capacity_update()
+            return
+        if not force and self._indexed_root == root:
+            return
+        # Best-effort: this only feeds the capacity estimate, so it must
+        # never take down the callback that triggered it.
+        try:
+            music_root = self._ipod_music_root()
+        except Exception:
+            return
+        self._indexed_root = root
+        threading.Thread(target=self._ipod_index_worker,
+                         args=(music_root,), daemon=True).start()
+
+    def _ipod_index_worker(self, music_root):
+        index = set()
+        try:
+            for dirpath, _dirs, files in os.walk(music_root):
+                for name in files:
+                    full = os.path.join(dirpath, name)
+                    try:
+                        if os.path.getsize(full) <= 0:
+                            continue
+                    except OSError:
+                        continue
+                    rel = os.path.relpath(full, music_root)
+                    index.add(rel.replace(os.sep, "/").lower())
+        except OSError:
+            pass
+        self.root.after(0, self._set_ipod_index, index)
+
+    def _set_ipod_index(self, index):
+        self._ipod_index = index
+        self._schedule_capacity_update()
+
+    # -- playlist sizes --
+
+    def _on_playlist_toggled(self, playlist_id):
+        var = self._playlist_vars.get(playlist_id, (None, None))[0]
+        if var is not None and var.get():
+            self._ensure_playlist_tracks(playlist_id)
+        self._schedule_capacity_update()
+
+    def _ensure_playlist_tracks(self, playlist_id):
+        """Fetch a playlist's tracks in the background purely to size it.
+
+        A playlist row only carries a track count, not bytes, so the only
+        way to know what it would cost is to ask the server.
+        """
+        if (playlist_id in self._playlist_track_cache
+                or playlist_id in self._playlist_fetching
+                or not self.plex):
+            return
+        self._playlist_fetching.add(playlist_id)
+        threading.Thread(target=self._playlist_tracks_worker,
+                         args=(playlist_id,), daemon=True).start()
+
+    def _playlist_tracks_worker(self, playlist_id):
+        try:
+            tracks = self.plex.get_playlist_tracks(playlist_id)
+        except (URLError, HTTPError, ElementTree.ParseError, OSError) as e:
+            self.root.after(0, self._log_msg,
+                            f"Could not size playlist: {e}")
+            tracks = []
+        self.root.after(0, self._store_playlist_tracks, playlist_id, tracks)
+
+    def _store_playlist_tracks(self, playlist_id, tracks):
+        self._playlist_fetching.discard(playlist_id)
+        self._playlist_track_cache[playlist_id] = tracks
+        self._schedule_capacity_update()
+
     # ---- sync ----
+
+    def _confirm_capacity(self):
+        """Ask before starting a sync that cannot finish.
+
+        Returns True to go ahead. Saying no leaves the selection untouched
+        so it can be trimmed and the sync retried.
+        """
+        capacity = self._capacity
+        if not capacity or capacity["over"] <= 0:
+            return True
+        proceed = messagebox.askyesno(
+            "Not enough space",
+            f"The selection needs about "
+            f"{self._human_size(capacity['over'])} more than the iPod has "
+            f"free.\n\n"
+            f"Selected:  {self._human_size(capacity['selected'])}\n"
+            f"Free:      {self._human_size(capacity['free'])}\n\n"
+            "Transfer until the iPod is full?\n\n"
+            "Tracks are copied in order and the sync stops cleanly when the "
+            "device fills up. Playlists will list only the tracks that "
+            "actually fit.\n\n"
+            "Choose No to cancel and change your selection.")
+        if not proceed:
+            self._log_msg(
+                f"Sync cancelled \u2014 selection is "
+                f"{self._human_size(capacity['over'])} larger than the free "
+                f"space on the iPod.")
+        return proceed
 
     def _on_sync(self):
         if self._syncing:
@@ -2781,6 +3025,12 @@ class App:
         if not root or not os.path.isdir(root):
             messagebox.showwarning(
                 "iPod not found", f"iPod not accessible: {root or '(none)'}")
+            return
+
+        # The capacity figures are updated on a short debounce, so bring
+        # them up to date before deciding whether to warn.
+        self._recompute_capacity()
+        if not self._confirm_capacity():
             return
 
         self.cfg["ipod_root"] = root
@@ -2942,12 +3192,32 @@ class App:
         copied = 0
         converted = 0
         failed = 0
+        filled = False
         for i, t in enumerate(to_copy):
             if self._cancel:
                 self.root.after(0, self._log_msg, "Sync cancelled by user.")
                 break
             rel = ipod_rel_path(t)
             dst = self.sync_engine.dest_path(t)
+
+            # Stop before writing rather than failing every remaining
+            # track with a disk-full error. The download needs room for a
+            # .part sidecar plus the final file, and FAT32 needs room for
+            # directory entries, hence the margin.
+            need = 0
+            try:
+                need = max(int(t.get("size") or 0), 0)
+            except (TypeError, ValueError):
+                need = 0
+            usage = disk_usage(self.sync_engine.ipod_root)
+            if usage and usage[2] < need + FREE_SPACE_MARGIN:
+                filled = True
+                self.root.after(
+                    0, self._log_msg,
+                    f"iPod is full \u2014 stopping here. {total - i} track(s) "
+                    f"were not copied.")
+                break
+
             try:
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
             except OSError as e:
@@ -3036,11 +3306,20 @@ class App:
         skipped = len(already_exist)
         conv_suffix = f" ({converted} downsampled)" if converted else ""
         fail_suffix = f", {failed} failed" if failed else ""
+        full_suffix = " \u2014 iPod filled up" if filled else ""
         self.root.after(
             0, self._log_msg,
             f"Done. {copied} downloaded{conv_suffix}, {skipped} skipped"
-            f"{fail_suffix}, {written} playlist(s) written.",
+            f"{fail_suffix}, {written} playlist(s) written{full_suffix}.",
         )
+        if filled:
+            self.root.after(0, lambda: messagebox.showinfo(
+                "iPod full",
+                f"The iPod filled up during the sync.\n\n"
+                f"{copied} track(s) were copied. The playlists list only "
+                f"what actually fits on the device.\n\n"
+                "Free some space from the Manage iPod tab, then sync again "
+                "to continue."))
 
     def _gather_library_tracks(self):
         tracks = []
@@ -3068,6 +3347,8 @@ class App:
     def _sync_finished(self):
         self._syncing = False
         self._set_busy(False)
+        # The device changed underneath us.
+        self._maybe_refresh_ipod_index(force=True)
 
     # ---- log / progress helpers ----
 

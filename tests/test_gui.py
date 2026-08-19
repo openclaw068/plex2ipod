@@ -12,6 +12,7 @@ Two things worth knowing if you extend these:
     registers. run_steps() below drives a real mainloop.
 """
 
+import os
 import unittest
 
 from helpers import (OFFSCREEN, StubPlex, TempAppDir, app_module,
@@ -822,3 +823,141 @@ class StaleCallbackTests(unittest.TestCase):
         self.app._toggle_theme()
         self.app.root.update()
         self.assertNotEqual(self.app._ui_generation, first)
+
+
+@requires_tk
+class CapacityBarTests(unittest.TestCase):
+    """The bar draws used / to-be-added / free, and shows the overflow."""
+
+    def setUp(self):
+        self.p2i = app_module()
+        self.root = tk.Tk()
+        self.root.geometry("400x80" + OFFSCREEN)
+        self.root.update()
+        self.addCleanup(lambda: destroy_tk(self.root))
+        self.bar = self.p2i.CapacityBar(self.root, self.p2i.THEMES["dark"])
+        self.bar.pack(fill="x")
+        self.root.update()
+
+    def segments(self):
+        return len(self.bar.find_all())
+
+    def test_no_ipod_draws_only_the_empty_track(self):
+        self.bar.set_values(0, 0, 0)
+        self.root.update()
+        empty = self.segments()
+        self.bar.set_values(100, 50, 10)
+        self.root.update()
+        self.assertGreater(self.segments(), empty)
+
+    def test_overflow_is_zero_when_the_selection_fits(self):
+        self.bar.set_values(100, 40, 20)
+        self.assertEqual(self.bar.overflow, 0)
+
+    def test_overflow_is_reported_when_it_does_not_fit(self):
+        self.bar.set_values(100, 90, 30)
+        self.assertEqual(self.bar.overflow, 20)
+
+    def test_overflow_is_zero_without_a_device(self):
+        self.bar.set_values(0, 0, 500)
+        self.assertEqual(self.bar.overflow, 0)
+
+    def test_exactly_full_is_not_an_overflow(self):
+        self.bar.set_values(100, 60, 40)
+        self.assertEqual(self.bar.overflow, 0)
+
+    def test_negative_inputs_are_clamped(self):
+        self.bar.set_values(-5, -5, -5)
+        self.root.update()
+        self.assertEqual(self.bar.overflow, 0)
+
+    def test_an_overflowing_bar_uses_the_error_colour(self):
+        theme = self.p2i.THEMES["dark"]
+        self.bar.set_values(100, 90, 30)
+        self.root.update()
+        colours = {self.bar.itemcget(i, "fill") for i in self.bar.find_all()}
+        self.assertIn(theme["error"], colours)
+
+    def test_a_fitting_bar_does_not_use_the_error_colour(self):
+        theme = self.p2i.THEMES["dark"]
+        self.bar.set_values(100, 40, 20)
+        self.root.update()
+        colours = {self.bar.itemcget(i, "fill") for i in self.bar.find_all()}
+        self.assertNotIn(theme["error"], colours)
+
+    def test_update_theme_repaints(self):
+        self.bar.set_values(100, 40, 20)
+        self.root.update()
+        self.bar.update_theme(self.p2i.THEMES["light"])
+        self.root.update()
+        colours = {self.bar.itemcget(i, "fill") for i in self.bar.find_all()}
+        self.assertIn(self.p2i.THEMES["light"]["progress_fill"], colours)
+
+
+@requires_tk
+class CapacityReadoutTests(unittest.TestCase):
+    """The line under the bar, and the state the sync gate reads."""
+
+    def setUp(self):
+        self.p2i = app_module()
+        self._cfg = TempAppDir(self.p2i)
+        self._cfg.__enter__()
+        self.addCleanup(lambda: self._cfg.__exit__(None, None, None))
+        self.app = self.p2i.App()
+        self.app.root.geometry("900x700" + OFFSCREEN)
+        self.app.root.update()
+        self.addCleanup(lambda: destroy_tk(self.app.root))
+
+    def test_no_ipod_says_so(self):
+        self.app._ipod_root_var.set("")
+        self.app._recompute_capacity()
+        self.assertIn("No iPod", self.app._capacity_var.get())
+        self.assertIsNone(self.app._capacity)
+
+    def test_a_real_volume_reports_used_and_free(self):
+        self.app._ipod_root_var.set(os.path.abspath(os.sep))
+        self.app._recompute_capacity()
+        text = self.app._capacity_var.get()
+        for word in ("used", "selected", "free of"):
+            self.assertIn(word, text)
+        self.assertIsNotNone(self.app._capacity)
+        self.assertEqual(self.app._capacity["over"], 0)
+
+    def test_an_oversized_selection_is_flagged(self):
+        self.app._ipod_root_var.set(os.path.abspath(os.sep))
+        usage = self.p2i.disk_usage(os.path.abspath(os.sep))
+        huge = {"title": "T", "artist": "A", "album": "B",
+                "filename": "x.flac", "container": "flac",
+                "duration_ms": 1, "part_key": "/p",
+                "size": usage[2] + 10 ** 9}
+        self.app._gather_library_tracks = lambda: [huge]
+        self.app._recompute_capacity()
+        self.assertGreater(self.app._capacity["over"], 0)
+        self.assertIn("over capacity", self.app._capacity_var.get())
+        self.assertEqual(self.app._capacity_label.cget("fg"),
+                         self.app.t["error"])
+
+    def test_a_fitting_selection_is_not_flagged(self):
+        self.app._ipod_root_var.set(os.path.abspath(os.sep))
+        self.app._gather_library_tracks = lambda: []
+        self.app._recompute_capacity()
+        self.assertNotIn("over capacity", self.app._capacity_var.get())
+        self.assertEqual(self.app._capacity_label.cget("fg"),
+                         self.app.t["fg_dim"])
+
+    def test_unsized_playlists_are_announced(self):
+        self.app._ipod_root_var.set(os.path.abspath(os.sep))
+        yes = tk.BooleanVar(value=True)
+        self.app._playlist_vars = {"9": (yes, {"id": "9", "title": "P"})}
+        self.app._playlist_track_cache = {}
+        self.app._recompute_capacity()
+        self.assertIn("sizing playlists", self.app._capacity_var.get())
+
+    def test_the_bar_survives_a_theme_toggle(self):
+        self.app._ipod_root_var.set(os.path.abspath(os.sep))
+        self.app._recompute_capacity()
+        self.app._toggle_theme()
+        self.app.root.update()
+        self.assertTrue(hasattr(self.app, "_capacity_bar"))
+        self.app._recompute_capacity()
+        self.assertIn("free of", self.app._capacity_var.get())
