@@ -4,12 +4,23 @@ list tracks that actually reached the iPod.
 
 import os
 import unittest
+from unittest import mock
 
 from helpers import (FailingAudio, IPodTestCase, NoAudio, StubPlex,
-                     make_track)
+                     app_module, make_track)
 
 
 class SyncTestCase(IPodTestCase):
+    def setUp(self):
+        super().setUp()
+        # FakeRoot runs after() callbacks inline, so a messagebox reached
+        # from a worker would pop a real modal dialog mid-test.
+        module = app_module().app
+        for name in ("showinfo", "showwarning", "showerror"):
+            patcher = mock.patch.object(module.messagebox, name)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def build(self, tracks, fail_keys=(), cancel_after=None, audio=None):
         app = self.bare_app()
         app.plex = StubPlex(tracks, fail_keys=fail_keys,
@@ -220,3 +231,76 @@ class DownloadBehaviourTests(SyncTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeviceFullTests(SyncTestCase):
+    """When the volume fills mid-sync, stop cleanly instead of failing
+    every remaining track with a disk-full error."""
+
+    def sync_with_free_space(self, app, free_bytes, downsample=False):
+        """Run a sync with disk_usage reporting a fixed amount free."""
+        module = app_module().app
+        total = 1000000
+        usage = (total, total - free_bytes, free_bytes)
+        with mock.patch.object(module, "disk_usage", lambda root: usage):
+            app._do_sync([("1", {"title": "Mix"})], [], downsample)
+
+    def test_stops_before_writing_when_there_is_no_room(self):
+        tracks = [make_track(n) for n in range(5)]
+        for t in tracks:
+            t["size"] = 1000
+        app = self.build(tracks)
+        self.sync_with_free_space(app, free_bytes=0)
+
+        self.assertEqual(self.ipod.basenames(), [])
+        self.assertTrue(any("full" in line.lower() for line in app.logs),
+                        app.logs)
+
+    def test_the_log_says_how_many_were_skipped(self):
+        tracks = [make_track(n) for n in range(5)]
+        for t in tracks:
+            t["size"] = 1000
+        app = self.build(tracks)
+        self.sync_with_free_space(app, free_bytes=0)
+        self.assertTrue(any("5 track(s) were not copied" in line
+                            for line in app.logs), app.logs)
+
+    def test_the_summary_reports_the_device_filling_up(self):
+        tracks = [make_track(n) for n in range(3)]
+        for t in tracks:
+            t["size"] = 1000
+        app = self.build(tracks)
+        self.sync_with_free_space(app, free_bytes=0)
+        self.assertTrue(any("filled up" in line for line in app.logs),
+                        app.logs)
+
+    def test_plenty_of_room_syncs_everything(self):
+        tracks = [make_track(n) for n in range(4)]
+        for t in tracks:
+            t["size"] = 1000
+        app = self.build(tracks)
+        self.sync_with_free_space(app, free_bytes=10 ** 9)
+
+        self.assertEqual(len(self.ipod.basenames()), 4)
+        self.assertFalse(any("full" in line.lower() for line in app.logs),
+                         app.logs)
+
+    def test_a_playlist_is_still_written_for_what_fitted(self):
+        # Nothing landed, so there is nothing to point a playlist at and
+        # the existing one must not be clobbered with an empty file.
+        tracks = [make_track(n) for n in range(3)]
+        for t in tracks:
+            t["size"] = 1000
+        self.ipod.write_m3u("Mix", ["/Music/Artist/Album/99 Old.flac"])
+        before = self.ipod.m3u_raw("Mix")
+        app = self.build(tracks)
+        self.sync_with_free_space(app, free_bytes=0)
+        self.assertEqual(self.ipod.m3u_raw("Mix"), before)
+
+    def test_unknown_disk_usage_does_not_block_the_sync(self):
+        tracks = [make_track(n) for n in range(3)]
+        app = self.build(tracks)
+        module = app_module().app
+        with mock.patch.object(module, "disk_usage", lambda root: None):
+            app._do_sync([("1", {"title": "Mix"})], [], False)
+        self.assertEqual(len(self.ipod.basenames()), 3)

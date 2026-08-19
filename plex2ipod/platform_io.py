@@ -5,9 +5,26 @@ app works in terms of an "iPod root path".
 """
 
 import os
+import shutil
 import subprocess
 
 IS_WINDOWS = os.name == "nt"
+
+
+def disk_usage(root):
+    """Return (total, used, free) bytes for the volume at `root`.
+
+    Returns None if the path is not readable, which is the normal state
+    while no iPod is plugged in. This is a cheap statvfs/GetDiskFreeSpaceEx
+    call and does not spin up the drive.
+    """
+    if not root:
+        return None
+    try:
+        usage = shutil.disk_usage(root)
+    except (OSError, ValueError):
+        return None
+    return usage.total, usage.used, usage.free
 
 
 def list_ipod_roots():

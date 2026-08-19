@@ -213,3 +213,86 @@ class StyledCheckbutton(tk.Frame):
         self._box.configure(bg=theme["bg_card"])
         self._label.configure(bg=theme["bg_card"], fg=theme["fg"])
         self._draw()
+
+
+class CapacityBar(tk.Canvas):
+    """A stacked bar showing how full the iPod is and how much the current
+    selection would add.
+
+    Three segments: what is already on the device, what syncing would add,
+    and free space. When the selection does not fit, the part that would
+    not fit is drawn in the error color so the overflow is visible at a
+    glance rather than only being reported at sync time.
+    """
+
+    HEIGHT = 14
+
+    def __init__(self, parent, theme, **kw):
+        super().__init__(parent, height=self.HEIGHT, highlightthickness=0,
+                         bd=0, bg=theme["bg"], **kw)
+        self.theme = theme
+        self._total = 0
+        self._used = 0
+        self._selected = 0
+        self.bind("<Configure>", lambda _e: self._draw())
+
+    def set_values(self, total, used, selected):
+        """total/used/selected in bytes. total of 0 means 'no iPod'."""
+        self._total = max(int(total or 0), 0)
+        self._used = max(int(used or 0), 0)
+        self._selected = max(int(selected or 0), 0)
+        self._draw()
+
+    @property
+    def overflow(self):
+        """Bytes by which the selection exceeds free space, else 0."""
+        if not self._total:
+            return 0
+        return max(self._used + self._selected - self._total, 0)
+
+    def update_theme(self, theme):
+        self.theme = theme
+        self.configure(bg=theme["bg"])
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        t = self.theme
+        width = self.winfo_width()
+        height = self.HEIGHT
+        radius = height // 2
+        if width <= 2 * radius:
+            return
+
+        self._pill(0, 0, width, height, radius, t["progress_bg"])
+        if not self._total:
+            return
+
+        # Everything is scaled against the larger of the device size and
+        # the projected total, so an overflowing selection still fits on
+        # screen and the overflow reads as a proportion.
+        scale_max = max(self._total, self._used + self._selected)
+        used_w = int(width * self._used / scale_max)
+        fits = max(min(self._selected, self._total - self._used), 0)
+        fits_w = int(width * fits / scale_max)
+        over_w = int(width * (self._selected - fits) / scale_max)
+
+        x = 0
+        for segment_w, color in (
+            (used_w, t["accent2"]),
+            (fits_w, t["progress_fill"]),
+            (over_w, t["error"]),
+        ):
+            if segment_w <= 0:
+                continue
+            self._pill(x, 0, min(x + segment_w, width), height, radius, color)
+            x += segment_w
+
+    def _pill(self, x1, y1, x2, y2, r, fill):
+        if x2 - x1 < 2 * r:
+            r = max((x2 - x1) // 2, 1)
+        self.create_arc(x1, y1, x1 + 2 * r, y2, start=90, extent=180,
+                        fill=fill, outline=fill)
+        self.create_arc(x2 - 2 * r, y1, x2, y2, start=270, extent=180,
+                        fill=fill, outline=fill)
+        self.create_rectangle(x1 + r, y1, x2 - r, y2, fill=fill, outline=fill)

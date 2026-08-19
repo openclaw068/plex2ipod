@@ -366,6 +366,14 @@ class IPodTestCase(unittest.TestCase):
         app._ipod_status_var = FakeVar("")
         app._manage_status_var = FakeVar("")
         app._update_m3u_var = FakeVar(True)
+        # Capacity accounting state, normally set up in App.__init__.
+        app._playlist_vars = {}
+        app._playlist_track_cache = {}
+        app._playlist_fetching = set()
+        app._ipod_index = None
+        app._indexed_root = None
+        app._capacity = None
+        app._capacity_after = None
         for key, value in attrs.items():
             setattr(app, key, value)
         return app

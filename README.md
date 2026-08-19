@@ -13,6 +13,10 @@ tree plus `.m3u` playlists that Rockbox can read.
 - Browse and select Plex **playlists** (smart playlists included) or drill into
   the **library** by artist → album → track
 - Downloads only what's missing; a song in two playlists is fetched once
+- **Capacity bar** showing how full the iPod is and what the current selection
+  would add. Tracks already on the device cost nothing. If the selection won't
+  fit, the bar turns red and Sync offers to fill the device and stop, or to
+  cancel so you can trim the selection
 - Optional **24-bit → 16-bit FLAC downsampling** with triangular high-pass
   dither, for iPod hardware that can't play hi-res files
 - **Manage iPod** tab: browse what's on the device, delete tracks, albums,
@@ -119,6 +123,7 @@ and the ffmpeg-dependent ones skip when ffmpeg isn't installed.
 | `test_sync` | downloading, dedup, collision warnings, `.m3u` lists only real files |
 | `test_manage` | deletion, Cancel, playlist cleanup and removal, empty-folder tidying |
 | `test_poll` | the iPod detection heartbeat and its idle cost |
+| `test_capacity` | free space, selection size, and the over-capacity warning |
 | `test_wheel` | mouse wheel normalization across X11, Windows and macOS |
 | `test_audio` | ffmpeg/ffprobe discovery and platform-correct binary choice |
 | `test_gui` | wheel bindings, styled widgets, connect flow, Manage-tab guards |
