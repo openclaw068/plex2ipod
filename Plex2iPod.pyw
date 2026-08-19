@@ -2675,6 +2675,16 @@ class App:
         return f"{n:.1f} PB"
 
     def _scan_ipod(self):
+        # Another long operation owns the busy state. Bail out rather than
+        # taking it over — this is also reached automatically when the user
+        # opens the Manage tab, and clearing busy at the end of the scan
+        # would wrongly re-enable Sync/Eject mid-operation. _manage_loaded
+        # stays False, so the scan runs on the next tab open or Refresh.
+        if self._busy or self._syncing:
+            self._manage_status_var.set(
+                "Busy — finish the current operation, then click Refresh.")
+            return
+
         root = self._ipod_root()
         if not root or not os.path.isdir(root):
             self._manage_status_var.set(f"iPod not accessible: {root or '(none)'}")
@@ -2691,6 +2701,7 @@ class App:
         self._manage_checked.clear()
         self._manage_data.clear()
 
+        self._set_busy(True)
         threading.Thread(
             target=self._scan_ipod_worker, args=(music_root,), daemon=True
         ).start()
@@ -2728,6 +2739,8 @@ class App:
             self.root.after(0, self._populate_manage_tree, data)
         except OSError as e:
             self.root.after(0, self._manage_status_var.set, f"Scan error: {e}")
+        finally:
+            self.root.after(0, self._set_busy, False)
 
     def _populate_manage_tree(self, data):
         total_files = 0
@@ -2835,6 +2848,12 @@ class App:
         return files
 
     def _on_remove_from_ipod(self):
+        if self._busy or self._syncing:
+            messagebox.showwarning(
+                "Operation in progress",
+                "Wait for the current operation to finish before removing "
+                "files.")
+            return
         files = self._gather_manage_files()
         if not files:
             messagebox.showinfo("Nothing selected",
@@ -2850,6 +2869,8 @@ class App:
             return
 
         update_m3u = self._update_m3u_var.get()
+        self._cancel = False
+        self._set_busy(True)
         threading.Thread(
             target=self._remove_worker, args=(files, update_m3u), daemon=True
         ).start()
@@ -2861,39 +2882,62 @@ class App:
             return 0
 
     def _remove_worker(self, files, update_m3u):
-        self.root.after(0, self._clear_log)
-        self.root.after(0, self._log_msg,
-                        f"Removing {len(files)} file(s) from iPod...")
-        deleted = 0
-        failed = 0
-        for f in files:
-            try:
-                os.remove(f)
-                deleted += 1
-                self.root.after(0, self._log_msg,
-                                f"Deleted: {os.path.basename(f)}")
-            except OSError as e:
-                failed += 1
-                self.root.after(0, self._log_msg, f"Failed: {f} ({e})")
-
-        # Clean up empty album/artist folders
-        music_root = self._ipod_music_root()
-        removed_dirs = self._cleanup_empty_dirs(music_root)
-        if removed_dirs:
+        try:
+            self.root.after(0, self._clear_log)
             self.root.after(0, self._log_msg,
-                            f"Removed {removed_dirs} empty folder(s).")
+                            f"Removing {len(files)} file(s) from iPod...")
+            # Track what actually left the disk. Only these may be stripped
+            # from the .m3u files — a cancelled or failed delete leaves the
+            # track on the iPod, so removing its playlist entry would lose
+            # the reference to a file that is still there.
+            removed_files = []
+            failed = 0
+            cancelled = False
+            for f in files:
+                if self._cancel:
+                    cancelled = True
+                    self.root.after(0, self._log_msg,
+                                    "Removal cancelled by user.")
+                    break
+                try:
+                    os.remove(f)
+                    removed_files.append(f)
+                    self.root.after(0, self._log_msg,
+                                    f"Deleted: {os.path.basename(f)}")
+                except OSError as e:
+                    failed += 1
+                    self.root.after(0, self._log_msg, f"Failed: {f} ({e})")
 
-        # Update m3u files
-        if update_m3u:
-            updated = self._update_m3u_files(files)
-            if updated:
+            # Clean up empty album/artist folders
+            music_root = self._ipod_music_root()
+            removed_dirs = self._cleanup_empty_dirs(music_root)
+            if removed_dirs:
                 self.root.after(0, self._log_msg,
-                                f"Updated {updated} playlist file(s).")
+                                f"Removed {removed_dirs} empty folder(s).")
 
-        self.root.after(0, self._log_msg,
-                        f"Done. {deleted} deleted, {failed} failed.")
-        # Refresh the tree
-        self.root.after(0, self._scan_ipod)
+            # Update m3u files
+            if update_m3u and removed_files:
+                updated = self._update_m3u_files(removed_files)
+                if updated:
+                    self.root.after(0, self._log_msg,
+                                    f"Updated {updated} playlist file(s).")
+
+            deleted = len(removed_files)
+            tail = ""
+            if cancelled:
+                tail = f", {len(files) - deleted - failed} skipped (cancelled)"
+            self.root.after(0, self._log_msg,
+                            f"Done. {deleted} deleted, {failed} failed{tail}.")
+        except Exception as e:
+            self.root.after(0, self._log_msg, f"Removal error: {e}")
+        finally:
+            # Clear busy first, then rescan — _scan_ipod refuses to run
+            # while another operation holds the busy state.
+            self.root.after(0, self._remove_finished)
+
+    def _remove_finished(self):
+        self._set_busy(False)
+        self._scan_ipod()
 
     def _cleanup_empty_dirs(self, root_dir):
         removed = 0
@@ -3565,6 +3609,12 @@ class App:
 
     def _on_sync(self):
         if self._syncing:
+            return
+        if self._busy:
+            messagebox.showwarning(
+                "Operation in progress",
+                "Wait for the current iPod operation to finish before "
+                "syncing.")
             return
         if not self.plex:
             messagebox.showwarning("Not connected", "Connect to Plex first.")
