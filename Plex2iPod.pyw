@@ -601,19 +601,26 @@ class SyncEngine:
 
     def __init__(self, ipod_root):
         self.ipod_root = ipod_root
+        # Resolve the on-disk music folder casing ('Music' vs 'music') once.
+        # music_folder_name() lists the volume root, and this used to run
+        # for every track in dest_path() and again in m3u_path() — several
+        # thousand directory listings over a large sync, all on a slow USB
+        # device. The casing cannot change mid-sync, so cache it.
+        self.music_folder = music_folder_name(ipod_root)
+        self._music_dir = os.path.join(ipod_root, self.music_folder)
 
     def ipod_music_dir(self):
-        return os.path.join(self.ipod_root, music_folder_name(self.ipod_root))
+        return self._music_dir
 
     def ipod_playlist_dir(self):
         return os.path.join(self.ipod_root, "Playlists")
 
     def dest_path(self, track):
         rel = ipod_rel_path(track).replace("/", os.sep)
-        return os.path.join(self.ipod_music_dir(), rel)
+        return os.path.join(self._music_dir, rel)
 
     def m3u_path(self, track):
-        return "/" + music_folder_name(self.ipod_root) + "/" + ipod_rel_path(track)
+        return "/" + self.music_folder + "/" + ipod_rel_path(track)
 
     def build_sync_plan(self, tracks):
         to_copy = []
@@ -1617,28 +1624,50 @@ class App:
         self._ipod_status_var.set("not found" if root else "")
         return False
 
+    # How often the heartbeat runs. While we are still hunting for an iPod
+    # we poll briskly so plugging one in feels instant; once one is selected
+    # and present there is nothing to discover, so we back right off.
+    POLL_SEARCHING_MS = 3000
+    POLL_SETTLED_MS = 15000
+
     def _poll_ipod(self):
         """Background heartbeat: auto-select an iPod when one is plugged in,
         and keep the dropdown / status in sync. Never overrides a valid
-        manual selection."""
+        manual selection.
+
+        Scanning is deliberately skipped once an iPod is already selected,
+        or while another operation is running. detect_ipod_roots() lists
+        every mount point to see whether it looks like an iPod, and doing
+        that every few seconds keeps a hard-drive iPod permanently spun up
+        and competes for I/O with an in-flight sync. Confirming the current
+        selection still exists is a single cheap stat. Use the refresh
+        button to re-enumerate on demand.
+        """
+        delay = self.POLL_SEARCHING_MS
         try:
+            cur = self._ipod_root()
+            cur_valid = bool(cur) and os.path.exists(cur)
+
+            if cur_valid or self._busy or self._syncing:
+                self._update_ipod_status()
+                delay = self.POLL_SETTLED_MS
+                return
+
             ipods = detect_ipod_roots()
             try:
                 self._ipod_combo["values"] = ipods or list_ipod_roots()
             except tk.TclError:
                 pass
-            cur = self._ipod_root()
-            cur_valid = bool(cur) and os.path.exists(cur)
-            if ipods and not cur_valid:
+            if ipods:
                 self._ipod_root_var.set(ipods[0])
                 if self._ipod_announced != ipods[0]:
                     self._ipod_announced = ipods[0]
                     self._log_msg(f"iPod detected: {ipods[0]}")
-            elif not ipods and not cur_valid:
+            else:
                 self._ipod_announced = None
             self._update_ipod_status()
         finally:
-            self.root.after(3000, self._poll_ipod)
+            self.root.after(delay, self._poll_ipod)
 
     def _ipod_root(self):
         """The selected iPod root path, normalized. Accepts a bare drive
