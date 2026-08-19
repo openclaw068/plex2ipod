@@ -180,7 +180,8 @@ class StubPlex:
     """
 
     def __init__(self, tracks=(), fail_keys=(), cancel_after=None, app=None,
-                 playlists=None, section_id="3", artists=()):
+                 playlists=None, section_id="3", artists=(), albums=None,
+                 album_tracks=None):
         self.tracks = list(tracks)
         self.fail_keys = set(fail_keys)
         self.cancel_after = cancel_after
@@ -189,6 +190,9 @@ class StubPlex:
         self._playlists = playlists if playlists is not None else []
         self._section_id = section_id
         self._artists = list(artists)
+        # {artist_key: [album, ...]} and {album_key: [track, ...]}
+        self._albums = albums or {}
+        self._album_tracks = album_tracks or {}
 
     # -- playlist / library API --
     def get_playlists(self):
@@ -199,6 +203,12 @@ class StubPlex:
 
     def get_artists(self, section_id):
         return list(self._artists)
+
+    def get_artist_albums(self, artist_key):
+        return list(self._albums.get(artist_key, []))
+
+    def get_album_tracks(self, album_key):
+        return list(self._album_tracks.get(album_key, []))
 
     def get_playlist_tracks(self, playlist_id):
         return list(self.tracks)

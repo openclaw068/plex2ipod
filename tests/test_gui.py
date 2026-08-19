@@ -485,3 +485,340 @@ class ManageTabGuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+ALBUMS = {"/k/1": [{"title": "Kid A", "key": "/a/1", "rating_key": "a1",
+                    "year": "2000"}]}
+ALBUM_TRACKS = {"/a/1": [
+    {"title": "Everything", "artist": "Radiohead", "album": "Kid A",
+     "duration_ms": 100000, "part_key": "/p/1", "filename": "01.flac",
+     "container": "flac", "size": 4096}]}
+
+
+@requires_tk
+class ThemeTogglePreservationTests(unittest.TestCase):
+    """Switching theme rebuilds every widget. That used to throw away the
+    user's selections, the loaded library tree, the Manage listing and the
+    busy state, and fire a fresh Plex round trip to repopulate."""
+
+    def setUp(self):
+        self.p2i = app_module()
+        self._cfg = TempAppDir(self.p2i)
+        self._cfg.__enter__()
+        self.addCleanup(lambda: self._cfg.__exit__(None, None, None))
+        self.stub = StubPlex(playlists=PLAYLISTS, artists=ARTISTS,
+                             albums=ALBUMS, album_tracks=ALBUM_TRACKS)
+        self._real_plex = self.p2i.PlexClient
+        self.p2i.PlexClient = lambda *a, **k: self.stub
+        self.addCleanup(self._restore)
+        self.app = self.p2i.App()
+        self.app.root.geometry("900x700" + OFFSCREEN)
+        self.app.root.update()
+        self.addCleanup(lambda: destroy_tk(self.app.root))
+
+    def _restore(self):
+        self.p2i.PlexClient = self._real_plex
+
+    def run_steps(self, steps):
+        app = self.app
+
+        def step(index=0):
+            if index >= len(steps):
+                app.root.quit()
+                return
+            delay, func = steps[index]
+            func(app)
+            app.root.after(delay, lambda: step(index + 1))
+
+        app.root.after(50, step)
+        app.root.mainloop()
+
+    def connect(self, app):
+        app.plex = self.stub
+        app._on_connected(PLAYLISTS, "3")
+
+    def artist_rows(self):
+        return [self.app._tree.item(i, "text")
+                for i in self.app._tree.get_children()]
+
+    # -- settings fields --
+    def test_connection_fields_survive(self):
+        self.run_steps([
+            (50, lambda a: (a._url_var.set("http://box:32400"),
+                            a._token_var.set("secret-token"))),
+            (300, lambda a: a._toggle_theme()),
+        ])
+        self.assertEqual(self.app._url_var.get(), "http://box:32400")
+        self.assertEqual(self.app._token_var.get(), "secret-token")
+
+    def test_an_unsaved_downsample_choice_survives(self):
+        self.run_steps([
+            (50, lambda a: a._downsample_var.set(False)),
+            (300, lambda a: a._toggle_theme()),
+        ])
+        self.assertFalse(self.app._downsample_var.get())
+
+    def test_the_update_m3u_choice_survives(self):
+        self.run_steps([
+            (50, lambda a: a._update_m3u_var.set(False)),
+            (300, lambda a: a._toggle_theme()),
+        ])
+        self.assertFalse(self.app._update_m3u_var.get())
+
+    # -- playlists --
+    def test_playlist_rows_and_ticks_survive(self):
+        checked = {}
+        self.run_steps([
+            (50, self.connect),
+            (400, lambda a: [v.set(True) for v, _p in
+                             a._playlist_vars.values()]),
+            (300, lambda a: a._toggle_theme()),
+            (300, lambda a: checked.update(
+                {pid: v.get() for pid, (v, _p) in a._playlist_vars.items()})),
+        ])
+        self.assertEqual(len(self.app._playlist_vars), len(PLAYLISTS))
+        self.assertTrue(all(checked.values()), checked)
+
+    def test_unticked_playlists_stay_unticked(self):
+        self.run_steps([
+            (50, self.connect),
+            (400, lambda a: a._toggle_theme()),
+        ])
+        self.assertTrue(self.app._playlist_vars)
+        self.assertFalse(any(v.get() for v, _p in
+                             self.app._playlist_vars.values()))
+
+    # -- library tree --
+    def test_the_loaded_artist_tree_survives(self):
+        self.run_steps([
+            (50, lambda a: a._select_tab(1)),
+            (1200, self.connect),
+            (300, lambda a: a._toggle_theme()),
+        ])
+        self.assertEqual(len(self.artist_rows()), len(ARTISTS))
+
+    def test_library_ticks_survive(self):
+        state = {}
+        self.run_steps([
+            (50, lambda a: a._select_tab(1)),
+            (1200, self.connect),
+            (300, lambda a: a._set_checked(a._tree.get_children()[0], True)),
+            (900, lambda a: a._toggle_theme()),
+            (300, lambda a: state.update(
+                rows=self.artist_rows(),
+                checked=[a._tree_checked[i]
+                         for i in a._tree.get_children()])),
+        ])
+        self.assertEqual(len(state["rows"]), len(ARTISTS))
+        self.assertTrue(state["checked"][0])
+        self.assertTrue(state["rows"][0].startswith("☑"))
+
+    def radiohead(self, app):
+        """The artist the stub actually has albums for. Rows sort with
+        Portishead first, so index 0 is the wrong one."""
+        for iid in app._tree.get_children():
+            if "Radiohead" in app._tree.item(iid, "text"):
+                return iid
+        raise AssertionError("Radiohead row not found")
+
+    def test_an_expanded_branch_keeps_its_children(self):
+        state = {}
+        self.run_steps([
+            (50, lambda a: a._select_tab(1)),
+            (1200, self.connect),
+            # Checking an artist lazily loads its albums, then its tracks.
+            (300, lambda a: a._set_checked(self.radiohead(a), True)),
+            (1500, lambda a: a._toggle_theme()),
+            (400, lambda a: state.update(
+                artists=list(a._tree.get_children()))),
+        ])
+        radiohead = [i for i in state["artists"]
+                     if "Radiohead" in self.app._tree.item(i, "text")]
+        self.assertEqual(len(radiohead), 1)
+        albums = self.app._tree.get_children(radiohead[0])
+        self.assertTrue(albums, "expanded albums were lost")
+        self.assertIn("Kid A", self.app._tree.item(albums[0], "text"))
+
+    def test_tree_data_is_still_usable_for_syncing(self):
+        state = {}
+        self.run_steps([
+            (50, lambda a: a._select_tab(1)),
+            (1200, self.connect),
+            (300, lambda a: a._set_checked(self.radiohead(a), True)),
+            (1500, lambda a: a._toggle_theme()),
+            (400, lambda a: state.update(
+                tracks=a._gather_library_tracks())),
+        ])
+        self.assertTrue(state["tracks"], "no tracks gathered after toggle")
+        self.assertEqual(state["tracks"][0]["title"], "Everything")
+
+    def test_no_reconnect_round_trip_is_made(self):
+        # The old code re-ran the whole connect worker to repopulate.
+        calls = {"n": 0}
+        self.run_steps([
+            (50, self.connect),
+            (400, lambda a: (setattr(self.stub, "get_playlists",
+                                     lambda: (calls.__setitem__(
+                                         "n", calls["n"] + 1), PLAYLISTS)[1]),
+                             a._toggle_theme())),
+            (600, lambda a: None),
+        ])
+        self.assertEqual(calls["n"], 0)
+
+    # -- manage tab --
+    def test_the_manage_listing_survives_without_a_rescan(self):
+        state = {}
+
+        def fake_populate(a):
+            a._populate_manage_tree(
+                [("Radiohead", "/m/Radiohead",
+                  [("Kid A", "/m/Radiohead/Kid A",
+                    [("01.flac", "/m/Radiohead/Kid A/01.flac", 10)])])],
+                [("Mix.m3u", "/p/Mix.m3u", 5)], "/p")
+
+        self.run_steps([
+            (50, lambda a: a._select_tab(2)),
+            (600, fake_populate),
+            (200, lambda a: setattr(a, "_scans", 0)),
+            (100, lambda a: setattr(
+                a, "_scan_ipod",
+                lambda: setattr(a, "_scans", a._scans + 1))),
+            (100, lambda a: a._toggle_theme()),
+            (400, lambda a: state.update(
+                top=[a._manage_tree.item(i, "text")
+                     for i in a._manage_tree.get_children()],
+                kinds=sorted({v["type"] for v in a._manage_data.values()}),
+                scans=a._scans)),
+        ])
+        self.assertEqual(len(state["top"]), 2)          # Playlists + artist
+        self.assertIn("playlist", state["kinds"])
+        self.assertIn("track", state["kinds"])
+        self.assertEqual(state["scans"], 0, "the tab rescanned the device")
+
+    # -- transient state --
+    def test_the_active_tab_survives(self):
+        for index in (0, 1, 2):
+            with self.subTest(tab=index):
+                self.run_steps([
+                    (50, lambda a, i=index: a._select_tab(i)),
+                    (400, lambda a: a._toggle_theme()),
+                ])
+                self.assertEqual(self.app._active_tab.get(), index)
+
+    def test_busy_state_survives(self):
+        # Toggling mid-operation used to hand back an enabled Sync button
+        # and a disabled Cancel button while the operation ran on.
+        state = {}
+        self.run_steps([
+            (50, lambda a: a._set_busy(True)),
+            (300, lambda a: a._toggle_theme()),
+            (300, lambda a: state.update(
+                busy=a._busy,
+                sync_disabled=a._sync_btn._disabled,
+                cancel_disabled=a._cancel_btn._disabled)),
+        ])
+        self.assertTrue(state["busy"])
+        self.assertTrue(state["sync_disabled"])
+        self.assertFalse(state["cancel_disabled"])
+
+    def test_idle_state_is_not_made_busy(self):
+        state = {}
+        self.run_steps([
+            (50, lambda a: a._toggle_theme()),
+            (300, lambda a: state.update(
+                sync_disabled=a._sync_btn._disabled)),
+        ])
+        self.assertFalse(state["sync_disabled"])
+
+    def test_progress_survives(self):
+        self.run_steps([
+            (50, lambda a: a._set_progress(42)),
+            (300, lambda a: a._toggle_theme()),
+        ])
+        self.assertEqual(self.app._progress_val, 42)
+
+    def test_the_status_line_survives(self):
+        self.run_steps([
+            (50, self.connect),
+            (400, lambda a: a._toggle_theme()),
+        ])
+        self.assertIn("Connected", self.app._status_var.get())
+
+    def test_the_log_survives(self):
+        self.run_steps([
+            (50, lambda a: a._log_msg("a distinctive log line")),
+            (300, lambda a: a._toggle_theme()),
+        ])
+        body = self.app._log.get("1.0", "end")
+        self.assertIn("a distinctive log line", body)
+
+    def test_toggling_twice_returns_to_the_original_theme(self):
+        start = self.app._current_theme
+        self.run_steps([
+            (50, self.connect),
+            (400, lambda a: a._toggle_theme()),
+            (400, lambda a: a._toggle_theme()),
+        ])
+        self.assertEqual(self.app._current_theme, start)
+        self.assertEqual(len(self.app._playlist_vars), len(PLAYLISTS))
+
+
+@requires_tk
+class StaleCallbackTests(unittest.TestCase):
+    """Item ids are per-widget and reused, so a library load that lands
+    after a rebuild must be dropped rather than inserted somewhere else."""
+
+    def setUp(self):
+        self.p2i = app_module()
+        self._cfg = TempAppDir(self.p2i)
+        self._cfg.__enter__()
+        self.addCleanup(lambda: self._cfg.__exit__(None, None, None))
+        self.app = self.p2i.App()
+        self.app.root.geometry("900x700" + OFFSCREEN)
+        self.app.root.update()
+        self.addCleanup(lambda: destroy_tk(self.app.root))
+
+    def test_a_stale_artist_load_is_ignored(self):
+        generation = self.app._ui_generation
+        self.app._toggle_theme()
+        self.app.root.update()
+        self.app._populate_artists(ARTISTS, generation)
+        self.assertEqual(self.app._tree.get_children(), ())
+
+    def test_a_current_artist_load_is_applied(self):
+        self.app._populate_artists(ARTISTS, self.app._ui_generation)
+        self.assertEqual(len(self.app._tree.get_children()), len(ARTISTS))
+
+    def test_a_load_with_no_generation_is_applied(self):
+        self.app._populate_artists(ARTISTS)
+        self.assertEqual(len(self.app._tree.get_children()), len(ARTISTS))
+
+    def test_a_stale_album_load_is_ignored(self):
+        self.app._populate_artists(ARTISTS)
+        parent = self.app._tree.get_children()[0]
+        generation = self.app._ui_generation
+        self.app._toggle_theme()
+        self.app.root.update()
+        before = self.app._capture_tree(
+            self.app._tree, self.app._tree_data, self.app._tree_checked)
+        self.app._populate_albums(parent, [{"title": "Ghost", "key": "/x",
+                                            "rating_key": "x", "year": ""}],
+                                  generation)
+        after = self.app._capture_tree(
+            self.app._tree, self.app._tree_data, self.app._tree_checked)
+        self.assertEqual(before, after)
+
+    def test_an_album_load_for_a_vanished_parent_is_ignored(self):
+        self.app._populate_artists(ARTISTS)
+        parent = self.app._tree.get_children()[0]
+        self.app._tree.delete(parent)
+        self.app._populate_albums(parent, [{"title": "Ghost", "key": "/x",
+                                            "rating_key": "x", "year": ""}],
+                                  self.app._ui_generation)
+        self.assertNotIn("Ghost", str(self.app._tree.get_children()))
+
+    def test_the_generation_advances_on_each_rebuild(self):
+        first = self.app._ui_generation
+        self.app._toggle_theme()
+        self.app.root.update()
+        self.assertNotEqual(self.app._ui_generation, first)
