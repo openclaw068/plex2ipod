@@ -1734,6 +1734,55 @@ class App:
         )
         self._status_label.pack(fill="x")
 
+    # ---- cross-platform mouse wheel ----
+
+    @staticmethod
+    def _wheel_units(event):
+        """Normalize a wheel event into a yview_scroll 'units' delta.
+
+        The three platforms report scrolling differently:
+          - X11 (Linux): Button-4 / Button-5 presses, no usable .delta
+          - Windows:     <MouseWheel> with .delta in multiples of 120
+          - macOS:       <MouseWheel> with small .delta values (often 1),
+                         which must NOT be divided by 120 or they floor to
+                         zero and nothing scrolls
+        Returns 0 when the event carries no scroll information.
+        """
+        if getattr(event, "num", None) == 4:
+            return -1
+        if getattr(event, "num", None) == 5:
+            return 1
+        try:
+            delta = int(event.delta)
+        except (AttributeError, TypeError, ValueError):
+            return 0
+        if not delta:
+            return 0
+        if abs(delta) >= 120:
+            return -delta // 120
+        return -delta
+
+    def _bind_mousewheel(self, widget, canvas, recurse=False):
+        """Make `widget` scroll `canvas` with the wheel on every platform.
+
+        Binds <MouseWheel> (Windows/macOS) alongside <Button-4>/<Button-5>
+        (X11). With recurse=True, also binds the widget's children — Tk
+        delivers the event to the specific widget under the pointer, and
+        child widgets are not covered by a parent's binding.
+        """
+        def on_wheel(event):
+            units = self._wheel_units(event)
+            if units:
+                canvas.yview_scroll(units, "units")
+            return "break"
+
+        targets = [widget]
+        if recurse:
+            targets.extend(widget.winfo_children())
+        for target in targets:
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                target.bind(seq, on_wheel)
+
     def _build_tabs(self):
         # Themed scrollbar style — used by both tabs
         sb_style = ttk.Style()
@@ -1831,10 +1880,8 @@ class App:
         pl_sb.pack(side="right", fill="y")
         self._pl_canvas.pack(side="left", fill="both", expand=True)
 
-        def _pl_mousewheel(event):
-            self._pl_canvas.yview_scroll(-1 * (event.delta // 120), "units")
-        self._pl_canvas.bind("<MouseWheel>", _pl_mousewheel)
-        self._pl_inner.bind("<MouseWheel>", _pl_mousewheel)
+        self._bind_mousewheel(self._pl_canvas, self._pl_canvas)
+        self._bind_mousewheel(self._pl_inner, self._pl_canvas)
 
         # -- Library tab --
         lib_frame = tk.Frame(self._tab_container.inner, bg=self.t["bg_card"])
@@ -2448,8 +2495,9 @@ class App:
             text = f"{pl['title']}{smart_tag}   ({pl['leaf_count']} tracks)"
             cb = StyledCheckbutton(self._pl_inner, text, var, self.t)
             cb.pack(fill="x", padx=4, pady=2)
-            cb.bind("<MouseWheel>",
-                    lambda e: self._pl_canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+            # recurse=True so the wheel also works with the pointer over the
+            # row's checkbox canvas or its label, not just the row frame.
+            self._bind_mousewheel(cb, self._pl_canvas, recurse=True)
             self._playlist_vars[pl["id"]] = (var, pl)
             self._playlist_widgets.append(cb)
 
