@@ -27,7 +27,9 @@ class PollTestCase(IPodTestCase):
     def tick(self, app):
         """Run exactly one heartbeat, recording whether it enumerated
         volumes and how long it asked to wait before the next one."""
-        module = self.p2i
+        # app.py binds these at import time, so that is the module whose
+        # attribute has to be replaced.
+        module = self.p2i.app
         real_detect = module.detect_ipod_roots
         real_list = module.list_ipod_roots
         stats = {"detect": 0, "list": 0}
@@ -84,7 +86,7 @@ class SearchingPollTests(PollTestCase):
 
     def test_auto_selects_a_detected_ipod_and_announces_it_once(self):
         app = self.make_polling_app(selected=False)
-        with mock.patch.object(self.p2i, "detect_ipod_roots",
+        with mock.patch.object(self.p2i.app, "detect_ipod_roots",
                                lambda: [self.ipod.path]):
             self.tick(app)
             self.assertEqual(app._ipod_root_var.get(), self.ipod.path)
@@ -99,7 +101,7 @@ class SearchingPollTests(PollTestCase):
     def test_never_overrides_a_valid_manual_selection(self):
         app = self.make_polling_app(selected=True)
         other = os.path.dirname(self.ipod.path)
-        with mock.patch.object(self.p2i, "detect_ipod_roots",
+        with mock.patch.object(self.p2i.app, "detect_ipod_roots",
                                lambda: [other]):
             self.tick(app)
         self.assertEqual(app._ipod_root_var.get(), self.ipod.path)

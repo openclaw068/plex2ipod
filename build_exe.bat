@@ -76,6 +76,8 @@ python -m PyInstaller ^
     --windowed ^
     --name Plex2iPod ^
     --icon Plex2iPod.ico ^
+    --paths . ^
+    --collect-submodules plex2ipod ^
     --add-data "Plex2iPod.ico;." ^
     --add-binary "ffmpeg\ffmpeg.exe;ffmpeg" ^
     --add-binary "ffmpeg\ffprobe.exe;ffmpeg" ^
