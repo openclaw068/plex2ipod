@@ -3,37 +3,35 @@
 Everything here is standard library only, matching the app itself.
 """
 
-import importlib.util
+import importlib
 import os
 import shutil
+import sys
 import tempfile
 import unittest
-from importlib.machinery import SourceFileLoader
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# PLEX2IPOD_APP points the suite at a different copy of the app. Useful for
-# checking that these tests actually fail against a known-bad version.
-APP_PATH = os.environ.get("PLEX2IPOD_APP") or os.path.join(
-    PROJECT_ROOT, "Plex2iPod.pyw")
+# PLEX2IPOD_ROOT points the suite at a different checkout, which is how to
+# check that these tests actually fail against a known-bad version.
+CHECKOUT_ROOT = os.environ.get("PLEX2IPOD_ROOT") or PROJECT_ROOT
 
 _module_cache = None
 
 
 def app_module():
-    """Import Plex2iPod.pyw and return it as a module.
+    """Import the plex2ipod package and return it.
 
-    A .pyw file is not importable by name, so load it through
-    SourceFileLoader. The app's ``if __name__ == "__main__"`` guard keeps
-    App().run() from firing during import.
+    The package re-exports the names tests read. For *patching*, reach for
+    the submodule where the name is actually looked up — the app binds its
+    collaborators at import time, so replacing an attribute on the package
+    would not affect it. See app_attr() below.
     """
     global _module_cache
     if _module_cache is None:
-        loader = SourceFileLoader("plex2ipod_under_test", APP_PATH)
-        spec = importlib.util.spec_from_loader(loader.name, loader)
-        module = importlib.util.module_from_spec(spec)
-        loader.exec_module(module)
-        _module_cache = module
+        if CHECKOUT_ROOT not in sys.path:
+            sys.path.insert(0, CHECKOUT_ROOT)
+        _module_cache = importlib.import_module("plex2ipod")
     return _module_cache
 
 
@@ -375,18 +373,22 @@ class IPodTestCase(unittest.TestCase):
 
 class TempAppDir:
     """Redirect the app's config directory so tests never touch the real
-    config.json sitting next to the source file."""
+    config.json in the project root.
+
+    ConfigManager imported app_dir into plex2ipod.config, so that is the
+    binding to replace — patching plex2ipod.app_dir would have no effect.
+    """
 
     def __init__(self, module):
-        self.module = module
+        self.config_module = module.config
         self.dir = tempfile.mkdtemp(prefix="plex2ipod-cfg-")
-        self._original = module.app_dir
+        self._original = self.config_module.app_dir
 
     def __enter__(self):
-        self.module.app_dir = lambda: self.dir
+        self.config_module.app_dir = lambda: self.dir
         return self.dir
 
     def __exit__(self, *exc):
-        self.module.app_dir = self._original
+        self.config_module.app_dir = self._original
         shutil.rmtree(self.dir, ignore_errors=True)
         return False

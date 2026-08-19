@@ -76,6 +76,29 @@ created next to the .exe on first run.
 
 To rebuild the icon and logo from scratch: `python make_icon.py`.
 
+## Layout
+
+`Plex2iPod.pyw` is just a launcher; the implementation is a package beside it.
+
+```
+Plex2iPod.pyw        launcher — creates the App and runs it
+plex2ipod/
+├── version.py       APP_VERSION
+├── paths.py         where config.json and bundled resources live
+├── platform_io.py   mounting, detecting and ejecting an iPod per OS
+├── naming.py        Plex metadata → FAT32-safe names and paths
+├── config.py        reading and writing config.json
+├── plexapi.py       plex.tv sign-in, server discovery, PlexClient
+├── audio.py         ffmpeg/ffprobe wrapper for FLAC downsampling
+├── sync.py          SyncEngine — destination planning and .m3u writing
+├── theme.py         dark and light palettes
+├── widgets.py       hand-drawn Tk cards, buttons and checkboxes
+└── app.py           the window and all of its behaviour
+```
+
+Dependencies run one way, from `app.py` down; nothing imports the package
+root, so there are no cycles.
+
 ## Tests
 
 ```bash
@@ -100,11 +123,11 @@ and the ffmpeg-dependent ones skip when ffmpeg isn't installed.
 | `test_audio` | ffmpeg/ffprobe discovery and platform-correct binary choice |
 | `test_gui` | wheel bindings, styled widgets, connect flow, Manage-tab guards |
 
-To check the suite still catches regressions, point it at an older copy of
-the app:
+To check the suite still catches regressions, point it at an older
+checkout of the project:
 
 ```bash
-PLEX2IPOD_APP=/path/to/old/Plex2iPod.pyw python3 run_tests.py
+PLEX2IPOD_ROOT=/path/to/older/checkout python3 run_tests.py
 ```
 
 ## On the iPod

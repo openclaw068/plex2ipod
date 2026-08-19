@@ -203,14 +203,14 @@ class AppLifecycleTests(unittest.TestCase):
         self._cfg = TempAppDir(self.p2i)
         self._cfg.__enter__()
         self.addCleanup(lambda: self._cfg.__exit__(None, None, None))
-        self._plex_cls = self.p2i.PlexClient
-        self.p2i.PlexClient = lambda *a, **k: StubPlex(
+        self._plex_cls = self.p2i.app.PlexClient
+        self.p2i.app.PlexClient = lambda *a, **k: StubPlex(
             playlists=PLAYLISTS, artists=ARTISTS)
         self.addCleanup(self._restore_plex)
         self.app = None
 
     def _restore_plex(self):
-        self.p2i.PlexClient = self._plex_cls
+        self.p2i.app.PlexClient = self._plex_cls
 
     def tearDown(self):
         if self.app is not None:
@@ -508,8 +508,8 @@ class ThemeTogglePreservationTests(unittest.TestCase):
         self.addCleanup(lambda: self._cfg.__exit__(None, None, None))
         self.stub = StubPlex(playlists=PLAYLISTS, artists=ARTISTS,
                              albums=ALBUMS, album_tracks=ALBUM_TRACKS)
-        self._real_plex = self.p2i.PlexClient
-        self.p2i.PlexClient = lambda *a, **k: self.stub
+        self._real_plex = self.p2i.app.PlexClient
+        self.p2i.app.PlexClient = lambda *a, **k: self.stub
         self.addCleanup(self._restore)
         self.app = self.p2i.App()
         self.app.root.geometry("900x700" + OFFSCREEN)
@@ -517,7 +517,7 @@ class ThemeTogglePreservationTests(unittest.TestCase):
         self.addCleanup(lambda: destroy_tk(self.app.root))
 
     def _restore(self):
-        self.p2i.PlexClient = self._real_plex
+        self.p2i.app.PlexClient = self._real_plex
 
     def run_steps(self, steps):
         app = self.app

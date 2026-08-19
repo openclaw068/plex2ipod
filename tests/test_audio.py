@@ -52,8 +52,8 @@ class RunnableTests(unittest.TestCase):
 
 
 class LocateTests(unittest.TestCase):
-    """_locate resolves relative to the app file, so these tests move the
-    module's __file__ into a throwaway directory holding a fake bundle."""
+    """_locate searches the folders resource_dirs() reports, so these tests
+    point that at a throwaway directory holding a fake bundle."""
 
     def setUp(self):
         self.p2i = app_module()
@@ -62,12 +62,14 @@ class LocateTests(unittest.TestCase):
             lambda: __import__("shutil").rmtree(self.dir, ignore_errors=True))
         self.bundle = os.path.join(self.dir, "ffmpeg")
         os.makedirs(self.bundle)
-        self._real_file = self.p2i.__file__
-        self.p2i.__file__ = os.path.join(self.dir, "Plex2iPod.pyw")
+        # audio.py imported resource_dirs by name, so that is the binding
+        # to replace.
+        self._real_dirs = self.p2i.audio.resource_dirs
+        self.p2i.audio.resource_dirs = lambda: [self.dir]
         self.addCleanup(self._restore)
 
     def _restore(self):
-        self.p2i.__file__ = self._real_file
+        self.p2i.audio.resource_dirs = self._real_dirs
 
     def drop(self, name, executable=False):
         path = os.path.join(self.bundle, name)
