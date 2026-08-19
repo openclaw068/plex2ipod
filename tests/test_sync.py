@@ -117,6 +117,67 @@ class PlaylistPreservationTests(SyncTestCase):
         self.assertTrue(any("omitted" in line for line in app.logs), app.logs)
 
 
+class CollisionWarningTests(SyncTestCase):
+    """When several tracks want one path, only one file can be written.
+    The app warns instead of renaming: the recovery features map iPod
+    files back to Plex through the same path, so a rename they cannot
+    reproduce would make Verify & Repair delete the file as an orphan.
+    """
+
+    def test_a_collision_is_reported(self):
+        a = make_track(1, album="Greatest Hits", filename="01 Song.flac")
+        b = make_track(2, album="Greatest Hits", filename="01 Song.flac")
+        app = self.build([a, b])
+        self.sync(app)
+        self.assertTrue(any("claimed by more than one track" in line
+                            for line in app.logs), app.logs)
+
+    def test_the_colliding_path_and_titles_are_named_in_the_log(self):
+        a = make_track(1, album="Greatest Hits", filename="01 Song.flac")
+        b = make_track(2, album="Greatest Hits", filename="01 Song.flac")
+        app = self.build([a, b])
+        self.sync(app)
+        # Match the detail line specifically ("<path>  <-  <titles>"), not
+        # merely a log line that happens to mention the filename.
+        detail = [line for line in app.logs if "  <-  " in line]
+        self.assertEqual(len(detail), 1, app.logs)
+        self.assertIn("01 song.flac", detail[0].lower())
+        self.assertIn(a["title"], detail[0])
+        self.assertIn(b["title"], detail[0])
+
+    def test_a_clean_selection_produces_no_warning(self):
+        app = self.build([make_track(n) for n in range(4)])
+        self.sync(app)
+        self.assertFalse(any("claimed by more than one" in line
+                             for line in app.logs), app.logs)
+
+    def test_the_same_track_in_two_playlists_is_not_reported(self):
+        tracks = [make_track(n) for n in range(3)]
+        app = self.build(tracks)
+        app._do_sync([("1", {"title": "A"}), ("2", {"title": "B"})],
+                     [], False)
+        self.assertFalse(any("claimed by more than one" in line
+                             for line in app.logs), app.logs)
+
+    def test_the_warning_is_capped(self):
+        tracks = []
+        for n in range(20):
+            tracks.append(make_track(100 + n, album="Dupe",
+                                     filename="01 Song.flac"))
+        app = self.build(tracks)
+        self.sync(app)
+        self.assertTrue(any("more" in line for line in app.logs), app.logs)
+
+    def test_syncing_still_completes_despite_a_collision(self):
+        a = make_track(1, album="Dupe", filename="01 Song.flac")
+        b = make_track(2, album="Dupe", filename="01 Song.flac")
+        c = make_track(3)
+        app = self.build([a, b, c])
+        self.sync(app)
+        # One file for the contested path, one for the clean track.
+        self.assertEqual(len(self.ipod.basenames()), 2)
+
+
 class DownloadBehaviourTests(SyncTestCase):
     def test_tracks_already_present_are_not_downloaded_again(self):
         tracks = [make_track(n) for n in range(4)]

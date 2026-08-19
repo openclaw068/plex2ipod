@@ -253,18 +253,52 @@ class ConfigManager:
 
 _INVALID_FAT_CHARS = '<>:"/\\|?*'
 
+# Windows reserves these device names. "CON.flac" cannot be created at all,
+# and the failure arrives as an opaque open()/mkdir error mid-sync rather
+# than anything that points at the name. The extension does not help — the
+# reservation applies to the stem.
+_RESERVED_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + ["COM%d" % i for i in range(1, 10)]
+    + ["LPT%d" % i for i in range(1, 10)]
+)
+
+# FAT32 long filenames cap one path component at 255 characters.
+MAX_COMPONENT_LEN = 255
+
 
 def sanitize_component(name):
     """Make a single path component safe for a FAT32 iPod volume.
+
     Strips characters Windows/FAT can't store and trailing dots/spaces
-    (which Windows silently drops, causing 'file not found' mismatches)."""
+    (which Windows silently drops, causing 'file not found' mismatches),
+    escapes reserved device names, and caps the length at what FAT32 can
+    actually hold.
+    """
     if not name:
         return "Unknown"
     cleaned = "".join("_" if c in _INVALID_FAT_CHARS else c for c in name)
     # Control chars -> underscore
     cleaned = "".join(c if ord(c) >= 32 else "_" for c in cleaned)
     cleaned = cleaned.rstrip(" .").strip()
-    return cleaned or "Unknown"
+    if not cleaned:
+        return "Unknown"
+
+    # "CON", "con.flac", "Com1.mp3" are all reserved. Prefixing keeps the
+    # name recognizable while making it storable.
+    stem = cleaned.split(".", 1)[0]
+    if stem.upper() in _RESERVED_NAMES:
+        cleaned = "_" + cleaned
+
+    if len(cleaned) > MAX_COMPONENT_LEN:
+        root, dot, ext = cleaned.rpartition(".")
+        if dot and 0 < len(ext) <= 10:
+            # Keep the extension — Rockbox picks the decoder from it.
+            cleaned = root[:MAX_COMPONENT_LEN - len(ext) - 1] + "." + ext
+        else:
+            cleaned = cleaned[:MAX_COMPONENT_LEN]
+        cleaned = cleaned.rstrip(" .") or "Unknown"
+    return cleaned
 
 
 def ipod_rel_path(track):
@@ -281,6 +315,29 @@ def ipod_rel_path(track):
         ext = (track.get("container") or "flac").lstrip(".")
         fname = f"{title}.{ext}"
     return f"{artist}/{album}/{fname}"
+
+
+def find_path_collisions(tracks):
+    """Group tracks that would be written to the same place on the iPod.
+
+    The destination is built from Artist/Album/filename, and two different
+    Plex tracks can share all three — two releases of the same album, a
+    multi-disc set whose discs both start at "01 ...", or a compilation
+    duplicated under the same artist. Only one file can occupy a path, so
+    without a warning the loser is simply never synced and its playlist
+    entry points at the winner's audio.
+
+    Returns {relative_path: [track, ...]} for paths claimed by more than
+    one distinct media part. Renaming is deliberately not attempted: the
+    recovery features map iPod files back to Plex through this same path,
+    so a rename that those cannot reproduce would make Verify & Repair
+    treat the file as an orphan and delete it.
+    """
+    by_path = {}
+    for track in tracks:
+        by_path.setdefault(ipod_rel_path(track).lower(), []).append(track)
+    return {rel: group for rel, group in by_path.items()
+            if len({t.get("part_key") for t in group}) > 1}
 
 
 # ---------------------------------------------------------------------------
@@ -623,10 +680,23 @@ class SyncEngine:
         return "/" + self.music_folder + "/" + ipod_rel_path(track)
 
     def build_sync_plan(self, tracks):
+        """Split tracks into (to_copy, already_exist).
+
+        A zero-byte file counts as missing: it is what an interrupted or
+        failed write leaves behind, and treating it as synced means the
+        track can never be recovered by syncing again. Size is not checked
+        beyond that — a downsampled file legitimately differs in size from
+        the copy on the server.
+        """
         to_copy = []
         already_exist = []
         for t in tracks:
-            if os.path.exists(self.dest_path(t)):
+            dest = self.dest_path(t)
+            try:
+                present = os.path.getsize(dest) > 0
+            except OSError:
+                present = False
+            if present:
                 already_exist.append(t)
             else:
                 to_copy.append(t)
@@ -1398,13 +1468,44 @@ class App:
         except Exception:
             self.root.iconify()
 
+    def _work_area(self):
+        """The usable desktop rectangle as (x, y, width, height).
+
+        Asks Windows for the work area, which already excludes the taskbar
+        wherever the user put it and is correct on scaled displays. Falls
+        back to the full screen minus a taskbar-sized strip if the call is
+        unavailable.
+        """
+        if os.name == "nt":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                class RECT(ctypes.Structure):
+                    _fields_ = [("left", wintypes.LONG),
+                                ("top", wintypes.LONG),
+                                ("right", wintypes.LONG),
+                                ("bottom", wintypes.LONG)]
+
+                rect = RECT()
+                SPI_GETWORKAREA = 0x0030
+                if ctypes.windll.user32.SystemParametersInfoW(
+                        SPI_GETWORKAREA, 0, ctypes.byref(rect), 0):
+                    width = rect.right - rect.left
+                    height = rect.bottom - rect.top
+                    if width > 0 and height > 0:
+                        return rect.left, rect.top, width, height
+            except Exception:
+                pass
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        return 0, 0, sw, max(sh - 48, 200)
+
     def _toggle_maximize(self):
         if not self._maximized:
             self._restore_geom = self.root.geometry()
-            sw = self.root.winfo_screenwidth()
-            sh = self.root.winfo_screenheight()
-            # Account for Windows taskbar by leaving a bit of room
-            self.root.geometry(f"{sw}x{sh - 48}+0+0")
+            x, y, width, height = self._work_area()
+            self.root.geometry(f"{width}x{height}+{x}+{y}")
             self._maximized = True
         else:
             if self._restore_geom:
@@ -1533,6 +1634,12 @@ class App:
             bg=self.t["bg"], fg=self.t["fg_dim"],
             font=("Segoe UI", 11),
         ).pack(side="left", pady=(6, 0))
+
+        tk.Label(
+            title_frame, text=f"  v{APP_VERSION}",
+            bg=self.t["bg"], fg=self.t["fg_dim"],
+            font=("Segoe UI", 9),
+        ).pack(side="left", pady=(9, 0))
 
         # Theme toggle: [moon] [switch] [sun] — the icon matching the
         # active mode is highlighted. Common pattern on modern web apps.
@@ -2744,13 +2851,42 @@ class App:
         self._manage_checked.clear()
         self._manage_data.clear()
 
+        playlist_dir = os.path.join(root, "Playlists")
         self._set_busy(True)
         threading.Thread(
-            target=self._scan_ipod_worker, args=(music_root,), daemon=True
+            target=self._scan_ipod_worker,
+            args=(music_root, playlist_dir), daemon=True,
         ).start()
 
-    def _scan_ipod_worker(self, music_root):
+    @staticmethod
+    def _scan_playlists(playlist_dir):
+        """Every .m3u in `playlist_dir` as (name, path, size), sorted.
+
+        Takes the directory as an argument rather than reading it from the
+        iPod StringVar: this runs on the scan worker thread, and touching a
+        Tk variable off the main thread is not safe.
+        """
+        found = []
         try:
+            names = os.listdir(playlist_dir)
+        except OSError:
+            return found
+        for fname in sorted(names, key=sort_key):
+            if not fname.lower().endswith((".m3u", ".m3u8")):
+                continue
+            full = os.path.join(playlist_dir, fname)
+            if not os.path.isfile(full):
+                continue
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                size = 0
+            found.append((fname, full, size))
+        return found
+
+    def _scan_ipod_worker(self, music_root, playlist_dir):
+        try:
+            playlists = self._scan_playlists(playlist_dir)
             data = []  # list of (artist, [(album, [(track, path, size)])])
             for artist_name in sorted(os.listdir(music_root),
                                       key=lambda s: sort_key(s)):
@@ -2779,15 +2915,45 @@ class App:
                         albums.append((album_name, album_path, tracks))
                 if albums:
                     data.append((artist_name, artist_path, albums))
-            self.root.after(0, self._populate_manage_tree, data)
+            self.root.after(0, self._populate_manage_tree, data,
+                            playlists, playlist_dir)
         except OSError as e:
             self.root.after(0, self._manage_status_var.set, f"Scan error: {e}")
         finally:
             self.root.after(0, self._set_busy, False)
 
-    def _populate_manage_tree(self, data):
+    def _populate_manage_tree(self, data, playlists=(), playlist_dir=None):
         total_files = 0
         total_size = 0
+
+        # Playlists first, as their own group. They live outside the music
+        # folder, so they are never caught by the artist/album walk and
+        # previously could not be removed from inside the app at all.
+        if playlists:
+            group_size = sum(s for _, _, s in playlists)
+            group_iid = self._manage_tree.insert(
+                "", "end",
+                text=f"☐ Playlists ({len(playlists)})",
+                values=(self._human_size(group_size),),
+                open=False,
+            )
+            self._manage_checked[group_iid] = False
+            self._manage_data[group_iid] = {
+                "type": "playlist_group",
+                "path": playlist_dir,
+                "size": group_size,
+            }
+            for name, path, size in playlists:
+                iid = self._manage_tree.insert(
+                    group_iid, "end",
+                    text=f"☐ {name}",
+                    values=(self._human_size(size),),
+                )
+                self._manage_checked[iid] = False
+                self._manage_data[iid] = {
+                    "type": "playlist", "path": path, "size": size,
+                }
+
         for artist_name, artist_path, albums in data:
             artist_size = sum(s for _, _, tracks in albums
                               for _, _, s in tracks)
@@ -2827,9 +2993,11 @@ class App:
                         "type": "track", "path": track_path, "size": track_size,
                     }
         self._manage_loaded = True
+        playlist_note = (f"  \u2022  {len(playlists)} playlists"
+                         if playlists else "")
         self._manage_status_var.set(
-            f"{len(data)} artists  \u2022  {total_files} tracks  \u2022  "
-            f"{self._human_size(total_size)}"
+            f"{len(data)} artists  \u2022  {total_files} tracks"
+            f"{playlist_note}  \u2022  {self._human_size(total_size)}"
         )
 
     def _on_manage_click(self, event):
@@ -2863,31 +3031,21 @@ class App:
     def _gather_manage_files(self):
         """Collect file paths to delete based on checked items."""
         files = set()
+        leaf_types = ("track", "playlist")
 
-        def collect(iid):
+        def walk(iid, inherited):
+            # A checked container selects everything beneath it; otherwise
+            # each child decides for itself. Depth is not assumed, so the
+            # Playlists group sits alongside artist/album/track fine.
+            checked = inherited or bool(self._manage_checked.get(iid))
             info = self._manage_data.get(iid)
-            if not info:
-                return
-            if info["type"] == "track":
+            if checked and info and info.get("type") in leaf_types:
                 files.add(info["path"])
-            else:
-                for child in self._manage_tree.get_children(iid):
-                    collect(child)
+            for child in self._manage_tree.get_children(iid):
+                walk(child, checked)
 
-        # Walk top-level items so we don't double-count
         for iid in self._manage_tree.get_children():
-            if self._manage_checked.get(iid):
-                # whole subtree
-                collect(iid)
-            else:
-                # check children individually
-                for album_iid in self._manage_tree.get_children(iid):
-                    if self._manage_checked.get(album_iid):
-                        collect(album_iid)
-                    else:
-                        for track_iid in self._manage_tree.get_children(album_iid):
-                            if self._manage_checked.get(track_iid):
-                                collect(track_iid)
+            walk(iid, False)
         return files
 
     def _on_remove_from_ipod(self):
@@ -2899,8 +3057,9 @@ class App:
             return
         files = self._gather_manage_files()
         if not files:
-            messagebox.showinfo("Nothing selected",
-                                "Select tracks, albums, or artists to remove.")
+            messagebox.showinfo(
+                "Nothing selected",
+                "Select tracks, albums, artists, or playlists to remove.")
             return
         total_size = sum(self._safe_size(f) for f in files)
         msg = (
@@ -2999,25 +3158,38 @@ class App:
         return removed
 
     def _update_m3u_files(self, deleted_files):
-        """Strip deleted tracks from any .m3u file in <iPod>/Playlists."""
+        """Strip deleted tracks from every .m3u file in <iPod>/Playlists.
+
+        Handles both playlist styles found on an iPod: the #EXTM3U form
+        this app writes, where each entry is an #EXTINF line followed by a
+        path, and the bare one-path-per-line form Rockbox itself saves.
+        Entries are matched on the path line, and an #EXTINF immediately
+        above a dropped path goes with it.
+        """
         root = self._ipod_root()
         playlist_dir = os.path.join(root, "Playlists")
         if not os.path.exists(playlist_dir):
             return 0
 
-        # Build set of m3u-style paths for deleted files
+        # Build the set of playlist-style paths for the deleted files.
+        # Rockbox is case sensitive about these but Windows is not, so
+        # match case-insensitively and on both separators.
         folder = music_folder_name(root)
         music_root = os.path.join(root, folder)
-        deleted_m3u_paths = set()
+        deleted_paths = set()
         for f in deleted_files:
             try:
                 rel = os.path.relpath(f, music_root)
-                m3u_path = "/" + folder + "/" + rel.replace("\\", "/")
-                deleted_m3u_paths.add(m3u_path)
-                # also store lowercase for comparison
-                deleted_m3u_paths.add(m3u_path.lower())
             except ValueError:
-                pass
+                continue
+            if rel.startswith(".."):
+                # Outside the music folder (a playlist file itself, say).
+                continue
+            deleted_paths.add(
+                ("/" + folder + "/" + rel.replace("\\", "/")).lower())
+
+        def is_deleted(path_line):
+            return path_line.replace("\\", "/").lower() in deleted_paths
 
         updated_count = 0
         for fname in os.listdir(playlist_dir):
@@ -3027,28 +3199,21 @@ class App:
             try:
                 with open(full, "r", encoding="utf-8") as fh:
                     lines = fh.readlines()
-            except OSError:
+            except (OSError, UnicodeDecodeError):
                 continue
 
             new_lines = []
-            i = 0
             modified = False
-            while i < len(lines):
-                line = lines[i]
+            for line in lines:
                 stripped = line.strip()
-                if stripped.startswith("#EXTINF") and i + 1 < len(lines):
-                    path_line = lines[i + 1].strip()
-                    if (path_line in deleted_m3u_paths or
-                            path_line.lower() in deleted_m3u_paths):
-                        i += 2  # skip both lines
-                        modified = True
-                        continue
-                    new_lines.append(line)
-                    new_lines.append(lines[i + 1])
-                    i += 2
+                if stripped and not stripped.startswith("#") \
+                        and is_deleted(stripped):
+                    # Drop the entry, plus the #EXTINF that introduced it.
+                    if new_lines and new_lines[-1].strip().startswith("#EXTINF"):
+                        new_lines.pop()
+                    modified = True
                     continue
                 new_lines.append(line)
-                i += 1
 
             if modified:
                 try:
@@ -3181,6 +3346,16 @@ class App:
         index = {}
         for t in tracks:
             index[ipod_rel_path(t).lower()] = t
+        # Where several library tracks share a destination path only one can
+        # be indexed, so a repair could pull down the wrong track for that
+        # file. Surface it rather than letting it happen quietly.
+        collisions = find_path_collisions(tracks)
+        if collisions:
+            self.root.after(
+                0, self._log_msg,
+                f"Note: {len(collisions)} path(s) in your library are shared "
+                f"by more than one track; repairs for those files may fetch "
+                f"the wrong one.")
         self.root.after(0, self._manage_status_var.set, "")
         return index, None
 
@@ -3754,10 +3929,35 @@ class App:
         finally:
             self.root.after(0, self._sync_finished)
 
+    def _warn_about_collisions(self, tracks, limit=5):
+        """Tell the user when several tracks want the same file on the iPod.
+
+        Only one of them can be written. Without this the loser just never
+        appears on the device and its playlist entry silently plays the
+        winner, which is very hard to notice among thousands of tracks.
+        """
+        collisions = find_path_collisions(tracks)
+        if not collisions:
+            return 0
+        self.root.after(
+            0, self._log_msg,
+            f"Warning: {len(collisions)} destination(s) are claimed by more "
+            f"than one track. Only one file can exist at each path, so the "
+            f"others will not be synced:")
+        for rel in sorted(collisions)[:limit]:
+            titles = sorted({t.get("title") or "?" for t in collisions[rel]})
+            self.root.after(0, self._log_msg,
+                            f"  {rel}  <-  {', '.join(titles)}")
+        if len(collisions) > limit:
+            self.root.after(0, self._log_msg,
+                            f"  ...and {len(collisions) - limit} more")
+        return len(collisions)
+
     def _do_sync(self, selected_playlists, lib_tracks, downsample):
         playlist_tracks = {}
         all_tracks = {}    # dedup key -> track (so a song in two playlists
                            # is only downloaded once)
+        selected = []      # every selected track, before deduplication
 
         def key(t):
             return ipod_rel_path(t).lower()
@@ -3767,17 +3967,21 @@ class App:
             try:
                 tracks = self.plex.get_playlist_tracks(pid)
                 playlist_tracks[pl["title"]] = tracks
+                selected.extend(tracks)
                 for t in tracks:
                     all_tracks[key(t)] = t
             except (URLError, HTTPError, OSError) as e:
                 self.root.after(0, self._log_msg, f"Error fetching {pl['title']}: {e}")
 
         for t in lib_tracks:
+            selected.append(t)
             all_tracks[key(t)] = t
 
         if not all_tracks:
             self.root.after(0, self._log_msg, "Nothing selected to sync.")
             return
+
+        self._warn_about_collisions(selected)
 
         unique_tracks = list(all_tracks.values())
         to_copy, already_exist = self.sync_engine.build_sync_plan(unique_tracks)

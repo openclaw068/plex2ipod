@@ -338,6 +338,111 @@ class AppLifecycleTests(unittest.TestCase):
 
 
 @requires_tk
+class ManageTreeTests(unittest.TestCase):
+    """Selection gathering over the Manage tree, including the Playlists
+    group that sits outside the artist/album/track hierarchy."""
+
+    def setUp(self):
+        from tkinter import ttk
+        self.p2i = app_module()
+        self.root = tk.Tk()
+        self.root.geometry("600x400" + OFFSCREEN)
+        self.root.update()
+        self.addCleanup(lambda: destroy_tk(self.root))
+
+        self.app = self.p2i.App.__new__(self.p2i.App)
+        self.app._manage_tree = ttk.Treeview(self.root, columns=("info",))
+        self.app._manage_checked = {}
+        self.app._manage_data = {}
+        self.app._manage_status_var = tk.StringVar()
+        self.app._ipod_root_var = tk.StringVar(value="/fake/ipod")
+        self.app._human_size = lambda n: "%dB" % n
+
+        data = [("Artist", "/m/Artist",
+                 [("Album", "/m/Artist/Album",
+                   [("01.flac", "/m/Artist/Album/01.flac", 10),
+                    ("02.flac", "/m/Artist/Album/02.flac", 20)])])]
+        playlists = [("Mix.m3u", "/p/Mix.m3u", 5),
+                     ("Gym.m3u", "/p/Gym.m3u", 7)]
+        self.app._populate_manage_tree(data, playlists, "/p")
+
+    def iids_of(self, kind):
+        return [iid for iid, info in self.app._manage_data.items()
+                if info["type"] == kind]
+
+    def test_playlists_appear_as_their_own_group(self):
+        self.assertEqual(len(self.iids_of("playlist_group")), 1)
+        self.assertEqual(len(self.iids_of("playlist")), 2)
+
+    def test_nothing_checked_gathers_nothing(self):
+        self.assertEqual(self.app._gather_manage_files(), set())
+
+    def test_checking_one_playlist_gathers_only_it(self):
+        iid = sorted(self.iids_of("playlist"))[0]
+        self.app._manage_checked[iid] = True
+        gathered = self.app._gather_manage_files()
+        self.assertEqual(gathered, {self.app._manage_data[iid]["path"]})
+
+    def test_checking_the_playlist_group_gathers_every_playlist(self):
+        group = self.iids_of("playlist_group")[0]
+        self.app._set_manage_checked(group, True)
+        self.assertEqual(self.app._gather_manage_files(),
+                         {"/p/Mix.m3u", "/p/Gym.m3u"})
+
+    def test_checking_an_artist_gathers_its_tracks_only(self):
+        artist = self.iids_of("artist")[0]
+        self.app._set_manage_checked(artist, True)
+        self.assertEqual(self.app._gather_manage_files(),
+                         {"/m/Artist/Album/01.flac", "/m/Artist/Album/02.flac"})
+
+    def test_container_paths_are_never_gathered_for_deletion(self):
+        for iid in self.app._manage_checked:
+            self.app._manage_checked[iid] = True
+        gathered = self.app._gather_manage_files()
+        self.assertNotIn("/m/Artist", gathered)
+        self.assertNotIn("/m/Artist/Album", gathered)
+        self.assertEqual(len(gathered), 4)      # 2 tracks + 2 playlists
+
+    def test_the_status_line_mentions_playlists(self):
+        self.assertIn("playlists", self.app._manage_status_var.get())
+
+    def test_a_scan_with_no_playlists_adds_no_group(self):
+        for iid in self.app._manage_tree.get_children():
+            self.app._manage_tree.delete(iid)
+        self.app._manage_checked.clear()
+        self.app._manage_data.clear()
+        self.app._populate_manage_tree([], [], "/p")
+        self.assertEqual(self.iids_of("playlist_group"), [])
+
+
+@requires_tk
+class WorkAreaTests(unittest.TestCase):
+    """Maximize used a hardcoded screenheight - 48 for the taskbar."""
+
+    def setUp(self):
+        self.p2i = app_module()
+        self.root = tk.Tk()
+        self.root.geometry("300x200" + OFFSCREEN)
+        self.root.update()
+        self.addCleanup(lambda: destroy_tk(self.root))
+        self.app = self.p2i.App.__new__(self.p2i.App)
+        self.app.root = self.root
+
+    def test_returns_a_plausible_rectangle(self):
+        x, y, width, height = self.app._work_area()
+        self.assertGreater(width, 0)
+        self.assertGreater(height, 0)
+        self.assertLessEqual(width, self.root.winfo_screenwidth())
+        self.assertLessEqual(height, self.root.winfo_screenheight())
+        self.assertGreaterEqual(x, 0)
+        self.assertGreaterEqual(y, 0)
+
+    def test_all_four_values_are_integers(self):
+        for value in self.app._work_area():
+            self.assertIsInstance(value, int)
+
+
+@requires_tk
 class ManageTabGuardTests(unittest.TestCase):
     """_scan_ipod must refuse to run while another operation owns the busy
     state, or it would clear busy mid-sync and re-enable Sync and Eject."""
