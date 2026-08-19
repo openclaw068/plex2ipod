@@ -1,0 +1,18 @@
+List of Playlists
+http://localhost:32400/playlists/all/?X-Plex-Token=YOUR_PLEX_TOKEN
+see localhost.xml
+note that the "Workout" playlist has id 51806 which is used in the url below
+
+Example Playlist .xml url for "Workout" playlist
+http://localhost:32400/playlists/51806/items?X-Plex-Token=YOUR_PLEX_TOKEN
+see playlist.xml
+
+iPod Rockbox Music Directory
+E:\Music
+
+iPod Rockbox Playlist Directory
+E:\Playlists
+
+Plex Music library location
+D:\Music
+

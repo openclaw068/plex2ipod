@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MediaContainer size="8">
+<Playlist ratingKey="1706" key="/playlists/1706/items" guid="com.plexapp.agents.none://45004f8d-8fe8-4e47-8e6d-e190e10d0421" type="playlist" title="&#10084;&#65039; Tracks" titleSort="&#65039; Tracks" summary="All your highly rated tracks, in one convenient place." smart="1" playlistType="audio" composite="/playlists/1706/composite/1763479469" icon="playlist://image.smart" viewCount="1" lastViewedAt="1752457553" duration="245000" leafCount="1" addedAt="1752457553" updatedAt="1763479469">
+</Playlist>
+<Playlist ratingKey="1707" key="/playlists/1707/items" guid="com.plexapp.agents.none://2a19f2bb-8f77-4419-b797-f23376af4ddd" type="playlist" title="All Music" summary="The easiest way to play or shuffle your entire collection." smart="1" playlistType="audio" composite="/playlists/1707/composite/1770525548" icon="playlist://image.smart" viewCount="1" lastViewedAt="1752457553" duration="4051283000" leafCount="17298" addedAt="1752457553" updatedAt="1770525548">
+</Playlist>
+<Playlist ratingKey="1710" key="/playlists/1710/items" guid="com.plexapp.agents.none://ab61d979-3e57-427c-a58e-c997bb01fcaf" type="playlist" title="Fresh &#10084;&#65039;" summary="Tracks you love but haven&#39;t heard lately." smart="1" playlistType="audio" composite="/playlists/1710/composite/1761239158" icon="playlist://image.smart" viewCount="1" lastViewedAt="1752457553" duration="245000" leafCount="1" addedAt="1752457553" updatedAt="1761239158">
+</Playlist>
+<Playlist ratingKey="1708" key="/playlists/1708/items" guid="com.plexapp.agents.none://aa15f88f-61a5-4477-aa02-30c8d6b5991a" type="playlist" title="Recently Added" summary="Music added to your library recently." smart="1" playlistType="audio" composite="/playlists/1708/composite/1761239158" icon="playlist://image.smart" viewCount="1" lastViewedAt="1752457553" duration="2004631000" leafCount="8792" addedAt="1752457553" updatedAt="1761239158">
+</Playlist>
+<Playlist ratingKey="1709" key="/playlists/1709/items" guid="com.plexapp.agents.none://97da2562-a49d-40c6-b9a1-3c166623acf6" type="playlist" title="Recently Played" summary="Tracks you&#39;ve listened to lately." smart="1" playlistType="audio" icon="playlist://image.smart" viewCount="1" lastViewedAt="1752457553" leafCount="0" addedAt="1752457553" updatedAt="1765898271">
+</Playlist>
+<Playlist ratingKey="51805" key="/playlists/51805/items" guid="com.plexapp.agents.none://b1fb8244-1c2a-41de-bcea-2fe7c092b029" type="playlist" title="General Mix" summary="" smart="0" playlistType="audio" composite="/playlists/51805/composite/1774990207" viewCount="7" lastViewedAt="1774982590" duration="102243000" leafCount="443" addedAt="1770406239" updatedAt="1774990207">
+</Playlist>
+<Playlist ratingKey="18126" key="/playlists/18126/items" guid="com.plexapp.agents.none://083b53a6-347c-4db6-b0e0-f7a758ab60a0" type="playlist" title="Remixes" summary="" smart="0" playlistType="audio" viewCount="13" lastViewedAt="1760569165" leafCount="0" addedAt="1759372574" updatedAt="1770524977">
+</Playlist>
+<Playlist ratingKey="51806" key="/playlists/51806/items" guid="com.plexapp.agents.none://2c745a6c-6c4d-42fc-8c73-3a7b773f8e54" type="playlist" title="Workout" summary="" smart="0" playlistType="audio" composite="/playlists/51806/composite/1775238499" viewCount="4" lastViewedAt="1771988334" duration="25407000" leafCount="108" addedAt="1770667677" updatedAt="1775238499">
+</Playlist>
+</MediaContainer>

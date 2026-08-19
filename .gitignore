@@ -1,0 +1,21 @@
+# Local runtime config — contains your Plex token. Never commit this.
+config.json
+
+# Syncthing / Nextcloud conflict copies (can duplicate config.json and its token)
+*.sync-conflict-*
+
+# Bundled ffmpeg binaries (~100 MB each). Fetch them with:
+#     python download_ffmpeg.py
+# See ffmpeg/README.txt.
+ffmpeg/*.exe
+ffmpeg/ffmpeg
+ffmpeg/ffprobe
+
+# PyInstaller build output
+build/
+dist/
+*.spec.bak
+
+# Python bytecode
+__pycache__/
+*.py[cod]
