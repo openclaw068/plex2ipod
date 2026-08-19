@@ -3745,6 +3745,12 @@ class App:
             f"{len(to_copy)} to download, {len(already_exist)} already on iPod.",
         )
 
+        # Keys of tracks that are actually on the iPod. Seeded with the
+        # files that were already there, then extended as downloads land.
+        # The .m3u files are built from this set, so a failed, skipped or
+        # cancelled track never gets an entry pointing at a missing file.
+        on_ipod = {key(t) for t in already_exist}
+
         total = len(to_copy)
         copied = 0
         converted = 0
@@ -3791,6 +3797,7 @@ class App:
                     if ok:
                         copied += 1
                         converted += 1
+                        on_ipod.add(key(t))
                         placed = True
                     else:
                         failed += 1
@@ -3803,6 +3810,7 @@ class App:
                 try:
                     os.replace(tmp, dst)
                     copied += 1
+                    on_ipod.add(key(t))
                 except OSError as e:
                     PlexClient._safe_remove(tmp)
                     failed += 1
@@ -3811,13 +3819,30 @@ class App:
 
             self.root.after(0, self._set_progress, (i + 1) / total * 100)
 
-        # Write playlists (even partially, unless cancelled outright)
+        # Write playlists. generate_m3u rewrites each file from scratch, so
+        # every entry must point at a track that is really on the device —
+        # otherwise Rockbox shows dead entries for downloads that failed or
+        # never ran. Tracks are filtered against on_ipod; a playlist with
+        # nothing on the device is left alone rather than being clobbered
+        # with an empty file.
+        written = 0
         for name, tracks in playlist_tracks.items():
-            if self._cancel:
-                break
+            kept = [t for t in tracks if key(t) in on_ipod]
+            dropped = len(tracks) - len(kept)
+            if not kept:
+                self.root.after(
+                    0, self._log_msg,
+                    f"Playlist skipped: {name}.m3u — none of its "
+                    f"{len(tracks)} track(s) are on the iPod.")
+                continue
             try:
-                self.sync_engine.generate_m3u(name, tracks)
-                self.root.after(0, self._log_msg, f"Playlist saved: {name}.m3u")
+                self.sync_engine.generate_m3u(name, kept)
+                written += 1
+                note = (f" ({dropped} track(s) omitted — not on iPod)"
+                        if dropped else "")
+                self.root.after(
+                    0, self._log_msg,
+                    f"Playlist saved: {name}.m3u — {len(kept)} track(s){note}")
             except OSError as e:
                 self.root.after(0, self._log_msg, f"Error writing {name}.m3u: {e}")
 
@@ -3827,7 +3852,7 @@ class App:
         self.root.after(
             0, self._log_msg,
             f"Done. {copied} downloaded{conv_suffix}, {skipped} skipped"
-            f"{fail_suffix}, {len(playlist_tracks)} playlist(s) written.",
+            f"{fail_suffix}, {written} playlist(s) written.",
         )
 
     def _gather_library_tracks(self):
