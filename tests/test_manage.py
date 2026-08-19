@@ -193,6 +193,154 @@ class PlaylistUpdateTests(RemovalTestCase):
         app = self.bare_app()
         self.assertEqual(app._update_m3u_files(["/whatever.flac"]), 0)
 
+    def test_a_playlist_without_extinf_lines_is_still_cleaned(self):
+        # Rockbox saves bare one-path-per-line playlists. The old parser
+        # only recognized #EXTINF/path pairs and left these untouched.
+        tracks = [make_track(n) for n in range(3)]
+        paths = self.ipod.add_tracks(tracks)
+        playlist = os.path.join(self.ipod.playlist_dir, "Rockbox.m3u")
+        os.makedirs(self.ipod.playlist_dir, exist_ok=True)
+        with open(playlist, "w", encoding="utf-8") as fh:
+            for t in tracks:
+                fh.write("/Music/Artist/Album/%s\n" % t["filename"])
+
+        app = self.bare_app()
+        self.assertEqual(app._update_m3u_files([paths[1]]), 1)
+        self.assertEqual(self.ipod.m3u_entries("Rockbox"),
+                         ["/Music/Artist/Album/00 Track.flac",
+                          "/Music/Artist/Album/02 Track.flac"])
+
+    def test_a_mixed_playlist_keeps_its_extinf_pairing(self):
+        tracks = [make_track(n) for n in range(3)]
+        paths = self.ipod.add_tracks(tracks)
+        os.makedirs(self.ipod.playlist_dir, exist_ok=True)
+        playlist = os.path.join(self.ipod.playlist_dir, "Mixed.m3u")
+        with open(playlist, "w", encoding="utf-8") as fh:
+            fh.write("#EXTM3U\n")
+            fh.write("#EXTINF:1,a\n/Music/Artist/Album/00 Track.flac\n")
+            fh.write("/Music/Artist/Album/01 Track.flac\n")   # bare entry
+            fh.write("#EXTINF:3,c\n/Music/Artist/Album/02 Track.flac\n")
+
+        app = self.bare_app()
+        app._update_m3u_files([paths[0], paths[1]])
+
+        with open(playlist, encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertNotIn("00 Track.flac", body)
+        self.assertNotIn("01 Track.flac", body)
+        self.assertIn("02 Track.flac", body)
+        # The #EXTINF for the removed track must go with it, and the one
+        # for the surviving track must stay.
+        self.assertEqual(body.count("#EXTINF"), 1)
+        self.assertIn("#EXTINF:3,c", body)
+        self.assertIn("#EXTM3U", body)
+
+    def test_backslash_separators_in_a_playlist_are_matched(self):
+        tracks = [make_track(0)]
+        paths = self.ipod.add_tracks(tracks)
+        os.makedirs(self.ipod.playlist_dir, exist_ok=True)
+        playlist = os.path.join(self.ipod.playlist_dir, "Win.m3u")
+        with open(playlist, "w", encoding="utf-8") as fh:
+            fh.write("\\Music\\Artist\\Album\\00 Track.flac\n")
+        app = self.bare_app()
+        app._update_m3u_files(paths)
+        with open(playlist, encoding="utf-8") as fh:
+            self.assertEqual(fh.read().strip(), "")
+
+    def test_comments_and_blank_lines_survive(self):
+        tracks = [make_track(0)]
+        paths = self.ipod.add_tracks(tracks)
+        os.makedirs(self.ipod.playlist_dir, exist_ok=True)
+        playlist = os.path.join(self.ipod.playlist_dir, "Notes.m3u")
+        with open(playlist, "w", encoding="utf-8") as fh:
+            fh.write("#EXTM3U\n# hand written note\n\n"
+                     "/Music/Artist/Album/00 Track.flac\n")
+        app = self.bare_app()
+        app._update_m3u_files(paths)
+        with open(playlist, encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertIn("# hand written note", body)
+        self.assertIn("#EXTM3U", body)
+        self.assertNotIn("00 Track.flac", body)
+
+
+class PlaylistScanTests(IPodTestCase):
+    """Playlists live outside the music folder, so the artist/album walk
+    never saw them and they could not be removed from inside the app."""
+
+    def test_finds_m3u_files(self):
+        self.ipod.write_m3u("Workout", ["/Music/a/b/c.flac"])
+        self.ipod.write_m3u("Chill", ["/Music/a/b/d.flac"])
+        app = self.bare_app()
+        names = [n for n, _p, _s in
+                 app._scan_playlists(self.ipod.playlist_dir)]
+        self.assertEqual(names, ["Chill.m3u", "Workout.m3u"])
+
+    def test_reports_each_playlist_size(self):
+        self.ipod.write_m3u("Workout", ["/Music/a/b/c.flac"])
+        app = self.bare_app()
+        (_name, path, size), = app._scan_playlists(self.ipod.playlist_dir)
+        self.assertEqual(size, os.path.getsize(path))
+
+    def test_ignores_non_playlist_files(self):
+        os.makedirs(self.ipod.playlist_dir, exist_ok=True)
+        with open(os.path.join(self.ipod.playlist_dir, "notes.txt"), "w") as fh:
+            fh.write("x")
+        self.ipod.write_m3u("Real", ["/Music/a/b/c.flac"])
+        app = self.bare_app()
+        self.assertEqual(
+            [n for n, _p, _s in app._scan_playlists(self.ipod.playlist_dir)],
+            ["Real.m3u"])
+
+    def test_missing_playlist_folder_yields_nothing(self):
+        app = self.bare_app()
+        self.assertEqual(app._scan_playlists(self.ipod.playlist_dir), [])
+
+    def test_the_scan_worker_never_reads_a_tk_variable(self):
+        """Tk variables belong to the main thread. The worker is handed the
+        paths it needs; reading _ipod_root_var here raised outright."""
+        self.ipod.write_m3u("Workout", ["/Music/a/b/c.flac"])
+        self.ipod.add_track()
+
+        class Exploding:
+            def get(self):
+                raise AssertionError(
+                    "scan worker read a Tk variable off the main thread")
+
+        app = self.bare_app()
+        captured = {}
+        app._populate_manage_tree = lambda *a: captured.setdefault("args", a)
+        app._set_busy = lambda value: None
+        app._ipod_root_var = Exploding()
+
+        app._scan_ipod_worker(self.ipod.music_dir, self.ipod.playlist_dir)
+
+        data, playlists, playlist_dir = captured["args"]
+        self.assertEqual([n for n, _p, _s in playlists], ["Workout.m3u"])
+        self.assertEqual(playlist_dir, self.ipod.playlist_dir)
+        self.assertEqual(len(data), 1)
+
+    def test_a_deleted_playlist_file_is_removed_from_disk(self):
+        path = self.ipod.write_m3u("Gone", ["/Music/a/b/c.flac"])
+        app = self.bare_app()
+        app.scans = []
+        app._scan_ipod = lambda: app.scans.append(True)
+        app._remove_worker({path}, True)
+        self.assertFalse(os.path.exists(path))
+
+    def test_removing_a_playlist_does_not_corrupt_other_playlists(self):
+        # The deleted path is outside the music folder, so it must not be
+        # treated as a track reference when the .m3u cleanup runs.
+        keep = self.ipod.write_m3u("Keep", ["/Music/Artist/Album/00 Track.flac"])
+        drop = self.ipod.write_m3u("Drop", ["/Music/Artist/Album/00 Track.flac"])
+        before = open(keep, "rb").read()
+        app = self.bare_app()
+        app.scans = []
+        app._scan_ipod = lambda: app.scans.append(True)
+        app._remove_worker({drop}, True)
+        self.assertFalse(os.path.exists(drop))
+        self.assertEqual(open(keep, "rb").read(), before)
+
 
 class EmptyFolderCleanupTests(IPodTestCase):
     def test_emptied_album_and_artist_folders_are_removed(self):

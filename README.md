@@ -15,8 +15,8 @@ tree plus `.m3u` playlists that Rockbox can read.
 - Downloads only what's missing; a song in two playlists is fetched once
 - Optional **24-bit → 16-bit FLAC downsampling** with triangular high-pass
   dither, for iPod hardware that can't play hi-res files
-- **Manage iPod** tab: browse what's on the device, delete tracks/albums/artists,
-  and strip the deleted entries out of your `.m3u` files
+- **Manage iPod** tab: browse what's on the device, delete tracks, albums,
+  artists or playlists, and strip the deleted entries out of your `.m3u` files
 - **Verify & Repair**: probes every FLAC on the iPod and re-downloads broken
   ones from Plex
 - **Rebuild Rockbox DB**: clears `.rockbox/database_*.tcd` so Rockbox rescans
@@ -91,10 +91,10 @@ and the ffmpeg-dependent ones skip when ffmpeg isn't installed.
 
 | Module | Covers |
 | --- | --- |
-| `test_paths` | filename sanitizing, iPod-relative paths, sort order, volume detection |
+| `test_paths` | filename sanitizing, reserved names, length caps, path collisions |
 | `test_sync_engine` | destination layout, `.m3u` path form, sync planning, folder-name caching |
-| `test_sync` | downloading, dedup, and the rule that a `.m3u` only lists real files |
-| `test_manage` | deletion, Cancel, playlist cleanup, empty-folder tidying |
+| `test_sync` | downloading, dedup, collision warnings, `.m3u` lists only real files |
+| `test_manage` | deletion, Cancel, playlist cleanup and removal, empty-folder tidying |
 | `test_poll` | the iPod detection heartbeat and its idle cost |
 | `test_wheel` | mouse wheel normalization across X11, Windows and macOS |
 | `test_audio` | ffmpeg/ffprobe discovery and platform-correct binary choice |
