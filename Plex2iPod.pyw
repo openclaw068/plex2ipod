@@ -680,10 +680,23 @@ class SyncEngine:
         return "/" + self.music_folder + "/" + ipod_rel_path(track)
 
     def build_sync_plan(self, tracks):
+        """Split tracks into (to_copy, already_exist).
+
+        A zero-byte file counts as missing: it is what an interrupted or
+        failed write leaves behind, and treating it as synced means the
+        track can never be recovered by syncing again. Size is not checked
+        beyond that — a downsampled file legitimately differs in size from
+        the copy on the server.
+        """
         to_copy = []
         already_exist = []
         for t in tracks:
-            if os.path.exists(self.dest_path(t)):
+            dest = self.dest_path(t)
+            try:
+                present = os.path.getsize(dest) > 0
+            except OSError:
+                present = False
+            if present:
                 already_exist.append(t)
             else:
                 to_copy.append(t)

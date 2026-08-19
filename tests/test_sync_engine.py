@@ -128,6 +128,26 @@ class SyncPlanTests(IPodTestCase):
         self.assertEqual(len(to_copy), 3)
         self.assertEqual(already, [])
 
+    def test_a_zero_byte_file_counts_as_missing(self):
+        # What an interrupted write leaves behind. Treating it as synced
+        # meant the track could never be recovered by syncing again.
+        engine = self.p2i.SyncEngine(self.ipod.path)
+        track = make_track(0)
+        self.ipod.add_track(track["artist"], track["album"],
+                            track["filename"], size=0)
+        to_copy, already = engine.build_sync_plan([track])
+        self.assertEqual(len(to_copy), 1)
+        self.assertEqual(already, [])
+
+    def test_a_non_empty_file_counts_as_present(self):
+        engine = self.p2i.SyncEngine(self.ipod.path)
+        track = make_track(0)
+        self.ipod.add_track(track["artist"], track["album"],
+                            track["filename"], size=1)
+        to_copy, already = engine.build_sync_plan([track])
+        self.assertEqual(to_copy, [])
+        self.assertEqual(len(already), 1)
+
 
 class GenerateM3uTests(IPodTestCase):
     def setUp(self):
