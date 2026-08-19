@@ -1734,6 +1734,55 @@ class App:
         )
         self._status_label.pack(fill="x")
 
+    # ---- cross-platform mouse wheel ----
+
+    @staticmethod
+    def _wheel_units(event):
+        """Normalize a wheel event into a yview_scroll 'units' delta.
+
+        The three platforms report scrolling differently:
+          - X11 (Linux): Button-4 / Button-5 presses, no usable .delta
+          - Windows:     <MouseWheel> with .delta in multiples of 120
+          - macOS:       <MouseWheel> with small .delta values (often 1),
+                         which must NOT be divided by 120 or they floor to
+                         zero and nothing scrolls
+        Returns 0 when the event carries no scroll information.
+        """
+        if getattr(event, "num", None) == 4:
+            return -1
+        if getattr(event, "num", None) == 5:
+            return 1
+        try:
+            delta = int(event.delta)
+        except (AttributeError, TypeError, ValueError):
+            return 0
+        if not delta:
+            return 0
+        if abs(delta) >= 120:
+            return -delta // 120
+        return -delta
+
+    def _bind_mousewheel(self, widget, canvas, recurse=False):
+        """Make `widget` scroll `canvas` with the wheel on every platform.
+
+        Binds <MouseWheel> (Windows/macOS) alongside <Button-4>/<Button-5>
+        (X11). With recurse=True, also binds the widget's children — Tk
+        delivers the event to the specific widget under the pointer, and
+        child widgets are not covered by a parent's binding.
+        """
+        def on_wheel(event):
+            units = self._wheel_units(event)
+            if units:
+                canvas.yview_scroll(units, "units")
+            return "break"
+
+        targets = [widget]
+        if recurse:
+            targets.extend(widget.winfo_children())
+        for target in targets:
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                target.bind(seq, on_wheel)
+
     def _build_tabs(self):
         # Themed scrollbar style — used by both tabs
         sb_style = ttk.Style()
@@ -1831,10 +1880,8 @@ class App:
         pl_sb.pack(side="right", fill="y")
         self._pl_canvas.pack(side="left", fill="both", expand=True)
 
-        def _pl_mousewheel(event):
-            self._pl_canvas.yview_scroll(-1 * (event.delta // 120), "units")
-        self._pl_canvas.bind("<MouseWheel>", _pl_mousewheel)
-        self._pl_inner.bind("<MouseWheel>", _pl_mousewheel)
+        self._bind_mousewheel(self._pl_canvas, self._pl_canvas)
+        self._bind_mousewheel(self._pl_inner, self._pl_canvas)
 
         # -- Library tab --
         lib_frame = tk.Frame(self._tab_container.inner, bg=self.t["bg_card"])
@@ -2433,6 +2480,15 @@ class App:
         self._tree_loaded.clear()
         self._tree_pending_check.clear()
 
+        # The artist load normally fires from _select_tab when the user
+        # first opens the Library tab. If that tab is *already* the active
+        # one when a connection lands, no tab change happens and the tree
+        # would sit empty until the user clicked away and back. Kick it off
+        # here instead. _load_artists guards on plex/_section_id and flips
+        # _artists_loaded itself, so this can't double-load.
+        if self._active_tab.get() == 1:   # 1 = Library
+            self._load_artists()
+
     # ---- playlists tab ----
 
     def _populate_playlists(self, playlists):
@@ -2448,8 +2504,9 @@ class App:
             text = f"{pl['title']}{smart_tag}   ({pl['leaf_count']} tracks)"
             cb = StyledCheckbutton(self._pl_inner, text, var, self.t)
             cb.pack(fill="x", padx=4, pady=2)
-            cb.bind("<MouseWheel>",
-                    lambda e: self._pl_canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+            # recurse=True so the wheel also works with the pointer over the
+            # row's checkbox canvas or its label, not just the row frame.
+            self._bind_mousewheel(cb, self._pl_canvas, recurse=True)
             self._playlist_vars[pl["id"]] = (var, pl)
             self._playlist_widgets.append(cb)
 
@@ -2618,6 +2675,16 @@ class App:
         return f"{n:.1f} PB"
 
     def _scan_ipod(self):
+        # Another long operation owns the busy state. Bail out rather than
+        # taking it over — this is also reached automatically when the user
+        # opens the Manage tab, and clearing busy at the end of the scan
+        # would wrongly re-enable Sync/Eject mid-operation. _manage_loaded
+        # stays False, so the scan runs on the next tab open or Refresh.
+        if self._busy or self._syncing:
+            self._manage_status_var.set(
+                "Busy — finish the current operation, then click Refresh.")
+            return
+
         root = self._ipod_root()
         if not root or not os.path.isdir(root):
             self._manage_status_var.set(f"iPod not accessible: {root or '(none)'}")
@@ -2634,6 +2701,7 @@ class App:
         self._manage_checked.clear()
         self._manage_data.clear()
 
+        self._set_busy(True)
         threading.Thread(
             target=self._scan_ipod_worker, args=(music_root,), daemon=True
         ).start()
@@ -2671,6 +2739,8 @@ class App:
             self.root.after(0, self._populate_manage_tree, data)
         except OSError as e:
             self.root.after(0, self._manage_status_var.set, f"Scan error: {e}")
+        finally:
+            self.root.after(0, self._set_busy, False)
 
     def _populate_manage_tree(self, data):
         total_files = 0
@@ -2778,6 +2848,12 @@ class App:
         return files
 
     def _on_remove_from_ipod(self):
+        if self._busy or self._syncing:
+            messagebox.showwarning(
+                "Operation in progress",
+                "Wait for the current operation to finish before removing "
+                "files.")
+            return
         files = self._gather_manage_files()
         if not files:
             messagebox.showinfo("Nothing selected",
@@ -2793,6 +2869,8 @@ class App:
             return
 
         update_m3u = self._update_m3u_var.get()
+        self._cancel = False
+        self._set_busy(True)
         threading.Thread(
             target=self._remove_worker, args=(files, update_m3u), daemon=True
         ).start()
@@ -2804,39 +2882,62 @@ class App:
             return 0
 
     def _remove_worker(self, files, update_m3u):
-        self.root.after(0, self._clear_log)
-        self.root.after(0, self._log_msg,
-                        f"Removing {len(files)} file(s) from iPod...")
-        deleted = 0
-        failed = 0
-        for f in files:
-            try:
-                os.remove(f)
-                deleted += 1
-                self.root.after(0, self._log_msg,
-                                f"Deleted: {os.path.basename(f)}")
-            except OSError as e:
-                failed += 1
-                self.root.after(0, self._log_msg, f"Failed: {f} ({e})")
-
-        # Clean up empty album/artist folders
-        music_root = self._ipod_music_root()
-        removed_dirs = self._cleanup_empty_dirs(music_root)
-        if removed_dirs:
+        try:
+            self.root.after(0, self._clear_log)
             self.root.after(0, self._log_msg,
-                            f"Removed {removed_dirs} empty folder(s).")
+                            f"Removing {len(files)} file(s) from iPod...")
+            # Track what actually left the disk. Only these may be stripped
+            # from the .m3u files — a cancelled or failed delete leaves the
+            # track on the iPod, so removing its playlist entry would lose
+            # the reference to a file that is still there.
+            removed_files = []
+            failed = 0
+            cancelled = False
+            for f in files:
+                if self._cancel:
+                    cancelled = True
+                    self.root.after(0, self._log_msg,
+                                    "Removal cancelled by user.")
+                    break
+                try:
+                    os.remove(f)
+                    removed_files.append(f)
+                    self.root.after(0, self._log_msg,
+                                    f"Deleted: {os.path.basename(f)}")
+                except OSError as e:
+                    failed += 1
+                    self.root.after(0, self._log_msg, f"Failed: {f} ({e})")
 
-        # Update m3u files
-        if update_m3u:
-            updated = self._update_m3u_files(files)
-            if updated:
+            # Clean up empty album/artist folders
+            music_root = self._ipod_music_root()
+            removed_dirs = self._cleanup_empty_dirs(music_root)
+            if removed_dirs:
                 self.root.after(0, self._log_msg,
-                                f"Updated {updated} playlist file(s).")
+                                f"Removed {removed_dirs} empty folder(s).")
 
-        self.root.after(0, self._log_msg,
-                        f"Done. {deleted} deleted, {failed} failed.")
-        # Refresh the tree
-        self.root.after(0, self._scan_ipod)
+            # Update m3u files
+            if update_m3u and removed_files:
+                updated = self._update_m3u_files(removed_files)
+                if updated:
+                    self.root.after(0, self._log_msg,
+                                    f"Updated {updated} playlist file(s).")
+
+            deleted = len(removed_files)
+            tail = ""
+            if cancelled:
+                tail = f", {len(files) - deleted - failed} skipped (cancelled)"
+            self.root.after(0, self._log_msg,
+                            f"Done. {deleted} deleted, {failed} failed{tail}.")
+        except Exception as e:
+            self.root.after(0, self._log_msg, f"Removal error: {e}")
+        finally:
+            # Clear busy first, then rescan — _scan_ipod refuses to run
+            # while another operation holds the busy state.
+            self.root.after(0, self._remove_finished)
+
+    def _remove_finished(self):
+        self._set_busy(False)
+        self._scan_ipod()
 
     def _cleanup_empty_dirs(self, root_dir):
         removed = 0
@@ -3509,6 +3610,12 @@ class App:
     def _on_sync(self):
         if self._syncing:
             return
+        if self._busy:
+            messagebox.showwarning(
+                "Operation in progress",
+                "Wait for the current iPod operation to finish before "
+                "syncing.")
+            return
         if not self.plex:
             messagebox.showwarning("Not connected", "Connect to Plex first.")
             return
@@ -3638,6 +3745,12 @@ class App:
             f"{len(to_copy)} to download, {len(already_exist)} already on iPod.",
         )
 
+        # Keys of tracks that are actually on the iPod. Seeded with the
+        # files that were already there, then extended as downloads land.
+        # The .m3u files are built from this set, so a failed, skipped or
+        # cancelled track never gets an entry pointing at a missing file.
+        on_ipod = {key(t) for t in already_exist}
+
         total = len(to_copy)
         copied = 0
         converted = 0
@@ -3684,6 +3797,7 @@ class App:
                     if ok:
                         copied += 1
                         converted += 1
+                        on_ipod.add(key(t))
                         placed = True
                     else:
                         failed += 1
@@ -3696,6 +3810,7 @@ class App:
                 try:
                     os.replace(tmp, dst)
                     copied += 1
+                    on_ipod.add(key(t))
                 except OSError as e:
                     PlexClient._safe_remove(tmp)
                     failed += 1
@@ -3704,13 +3819,30 @@ class App:
 
             self.root.after(0, self._set_progress, (i + 1) / total * 100)
 
-        # Write playlists (even partially, unless cancelled outright)
+        # Write playlists. generate_m3u rewrites each file from scratch, so
+        # every entry must point at a track that is really on the device —
+        # otherwise Rockbox shows dead entries for downloads that failed or
+        # never ran. Tracks are filtered against on_ipod; a playlist with
+        # nothing on the device is left alone rather than being clobbered
+        # with an empty file.
+        written = 0
         for name, tracks in playlist_tracks.items():
-            if self._cancel:
-                break
+            kept = [t for t in tracks if key(t) in on_ipod]
+            dropped = len(tracks) - len(kept)
+            if not kept:
+                self.root.after(
+                    0, self._log_msg,
+                    f"Playlist skipped: {name}.m3u — none of its "
+                    f"{len(tracks)} track(s) are on the iPod.")
+                continue
             try:
-                self.sync_engine.generate_m3u(name, tracks)
-                self.root.after(0, self._log_msg, f"Playlist saved: {name}.m3u")
+                self.sync_engine.generate_m3u(name, kept)
+                written += 1
+                note = (f" ({dropped} track(s) omitted — not on iPod)"
+                        if dropped else "")
+                self.root.after(
+                    0, self._log_msg,
+                    f"Playlist saved: {name}.m3u — {len(kept)} track(s){note}")
             except OSError as e:
                 self.root.after(0, self._log_msg, f"Error writing {name}.m3u: {e}")
 
@@ -3720,7 +3852,7 @@ class App:
         self.root.after(
             0, self._log_msg,
             f"Done. {copied} downloaded{conv_suffix}, {skipped} skipped"
-            f"{fail_suffix}, {len(playlist_tracks)} playlist(s) written.",
+            f"{fail_suffix}, {written} playlist(s) written.",
         )
 
     def _gather_library_tracks(self):
