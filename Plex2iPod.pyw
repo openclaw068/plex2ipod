@@ -253,18 +253,52 @@ class ConfigManager:
 
 _INVALID_FAT_CHARS = '<>:"/\\|?*'
 
+# Windows reserves these device names. "CON.flac" cannot be created at all,
+# and the failure arrives as an opaque open()/mkdir error mid-sync rather
+# than anything that points at the name. The extension does not help — the
+# reservation applies to the stem.
+_RESERVED_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + ["COM%d" % i for i in range(1, 10)]
+    + ["LPT%d" % i for i in range(1, 10)]
+)
+
+# FAT32 long filenames cap one path component at 255 characters.
+MAX_COMPONENT_LEN = 255
+
 
 def sanitize_component(name):
     """Make a single path component safe for a FAT32 iPod volume.
+
     Strips characters Windows/FAT can't store and trailing dots/spaces
-    (which Windows silently drops, causing 'file not found' mismatches)."""
+    (which Windows silently drops, causing 'file not found' mismatches),
+    escapes reserved device names, and caps the length at what FAT32 can
+    actually hold.
+    """
     if not name:
         return "Unknown"
     cleaned = "".join("_" if c in _INVALID_FAT_CHARS else c for c in name)
     # Control chars -> underscore
     cleaned = "".join(c if ord(c) >= 32 else "_" for c in cleaned)
     cleaned = cleaned.rstrip(" .").strip()
-    return cleaned or "Unknown"
+    if not cleaned:
+        return "Unknown"
+
+    # "CON", "con.flac", "Com1.mp3" are all reserved. Prefixing keeps the
+    # name recognizable while making it storable.
+    stem = cleaned.split(".", 1)[0]
+    if stem.upper() in _RESERVED_NAMES:
+        cleaned = "_" + cleaned
+
+    if len(cleaned) > MAX_COMPONENT_LEN:
+        root, dot, ext = cleaned.rpartition(".")
+        if dot and 0 < len(ext) <= 10:
+            # Keep the extension — Rockbox picks the decoder from it.
+            cleaned = root[:MAX_COMPONENT_LEN - len(ext) - 1] + "." + ext
+        else:
+            cleaned = cleaned[:MAX_COMPONENT_LEN]
+        cleaned = cleaned.rstrip(" .") or "Unknown"
+    return cleaned
 
 
 def ipod_rel_path(track):
@@ -281,6 +315,29 @@ def ipod_rel_path(track):
         ext = (track.get("container") or "flac").lstrip(".")
         fname = f"{title}.{ext}"
     return f"{artist}/{album}/{fname}"
+
+
+def find_path_collisions(tracks):
+    """Group tracks that would be written to the same place on the iPod.
+
+    The destination is built from Artist/Album/filename, and two different
+    Plex tracks can share all three — two releases of the same album, a
+    multi-disc set whose discs both start at "01 ...", or a compilation
+    duplicated under the same artist. Only one file can occupy a path, so
+    without a warning the loser is simply never synced and its playlist
+    entry points at the winner's audio.
+
+    Returns {relative_path: [track, ...]} for paths claimed by more than
+    one distinct media part. Renaming is deliberately not attempted: the
+    recovery features map iPod files back to Plex through this same path,
+    so a rename that those cannot reproduce would make Verify & Repair
+    treat the file as an orphan and delete it.
+    """
+    by_path = {}
+    for track in tracks:
+        by_path.setdefault(ipod_rel_path(track).lower(), []).append(track)
+    return {rel: group for rel, group in by_path.items()
+            if len({t.get("part_key") for t in group}) > 1}
 
 
 # ---------------------------------------------------------------------------
@@ -3181,6 +3238,16 @@ class App:
         index = {}
         for t in tracks:
             index[ipod_rel_path(t).lower()] = t
+        # Where several library tracks share a destination path only one can
+        # be indexed, so a repair could pull down the wrong track for that
+        # file. Surface it rather than letting it happen quietly.
+        collisions = find_path_collisions(tracks)
+        if collisions:
+            self.root.after(
+                0, self._log_msg,
+                f"Note: {len(collisions)} path(s) in your library are shared "
+                f"by more than one track; repairs for those files may fetch "
+                f"the wrong one.")
         self.root.after(0, self._manage_status_var.set, "")
         return index, None
 
@@ -3754,10 +3821,35 @@ class App:
         finally:
             self.root.after(0, self._sync_finished)
 
+    def _warn_about_collisions(self, tracks, limit=5):
+        """Tell the user when several tracks want the same file on the iPod.
+
+        Only one of them can be written. Without this the loser just never
+        appears on the device and its playlist entry silently plays the
+        winner, which is very hard to notice among thousands of tracks.
+        """
+        collisions = find_path_collisions(tracks)
+        if not collisions:
+            return 0
+        self.root.after(
+            0, self._log_msg,
+            f"Warning: {len(collisions)} destination(s) are claimed by more "
+            f"than one track. Only one file can exist at each path, so the "
+            f"others will not be synced:")
+        for rel in sorted(collisions)[:limit]:
+            titles = sorted({t.get("title") or "?" for t in collisions[rel]})
+            self.root.after(0, self._log_msg,
+                            f"  {rel}  <-  {', '.join(titles)}")
+        if len(collisions) > limit:
+            self.root.after(0, self._log_msg,
+                            f"  ...and {len(collisions) - limit} more")
+        return len(collisions)
+
     def _do_sync(self, selected_playlists, lib_tracks, downsample):
         playlist_tracks = {}
         all_tracks = {}    # dedup key -> track (so a song in two playlists
                            # is only downloaded once)
+        selected = []      # every selected track, before deduplication
 
         def key(t):
             return ipod_rel_path(t).lower()
@@ -3767,17 +3859,21 @@ class App:
             try:
                 tracks = self.plex.get_playlist_tracks(pid)
                 playlist_tracks[pl["title"]] = tracks
+                selected.extend(tracks)
                 for t in tracks:
                     all_tracks[key(t)] = t
             except (URLError, HTTPError, OSError) as e:
                 self.root.after(0, self._log_msg, f"Error fetching {pl['title']}: {e}")
 
         for t in lib_tracks:
+            selected.append(t)
             all_tracks[key(t)] = t
 
         if not all_tracks:
             self.root.after(0, self._log_msg, "Nothing selected to sync.")
             return
+
+        self._warn_about_collisions(selected)
 
         unique_tracks = list(all_tracks.values())
         to_copy, already_exist = self.sync_engine.build_sync_plan(unique_tracks)
