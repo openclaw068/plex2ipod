@@ -391,7 +391,6 @@ class PlexClient:
         # Plex returns 503 when overloaded (lots of parallel artist
         # expansions for example). Back off and retry a few times so
         # transient overload doesn't surface as a hard failure.
-        import time
         last_err = None
         for attempt in range(5):
             try:
@@ -419,7 +418,6 @@ class PlexClient:
         sep = "&" if "?" in part_key else "?"
         url = f"{self.base_url}{part_key}{sep}X-Plex-Token={self.token}"
         tmp = dest_path + ".part"
-        import time
         last_err = None
         for attempt in range(3):
             try:
@@ -887,7 +885,6 @@ class AudioConverter:
                 return True, None
             except OSError as e:
                 last_err = e
-                import time
                 time.sleep(0.4)
 
         # Replace failed twice. Make sure we never leave a .tmp orphan
@@ -987,6 +984,10 @@ class StyledButton(tk.Canvas):
         self._bg = bg or theme["accent"]
         self._hover_bg = hover_bg or theme["accent_hover"]
         self._fg = fg or theme["sync_btn_fg"]
+        # Disabled colors come from the theme rather than being hardcoded,
+        # so a greyed-out button reads correctly in light mode too.
+        self._disabled_bg = theme["check_off"]
+        self._disabled_fg = theme["fg_dim"]
         self._radius = radius
         self._font = font
         self._disabled = False
@@ -1013,7 +1014,7 @@ class StyledButton(tk.Canvas):
         self.create_rectangle(0, r, r, h - r, fill=color, outline=color)
         self.create_rectangle(w - r, r, w, h - r, fill=color, outline=color)
         # text
-        fg = self._fg if not self._disabled else "#666666"
+        fg = self._disabled_fg if self._disabled else self._fg
         self.create_text(w // 2, h // 2, text=self._text,
                          fill=fg, font=self._font)
 
@@ -1023,7 +1024,7 @@ class StyledButton(tk.Canvas):
 
     def set_state(self, enabled):
         self._disabled = not enabled
-        self._draw(self._bg if enabled else "#333344")
+        self._draw(self._bg if enabled else self._disabled_bg)
 
 
 class StyledCheckbutton(tk.Frame):
@@ -1062,7 +1063,6 @@ class StyledCheckbutton(tk.Frame):
         self._enabled = bool(enabled)
         fg = self._theme["fg"] if self._enabled else self._theme["fg_dim"]
         self._label.configure(fg=fg)
-        self.configure(cursor="" if not self._enabled else "")
         self._draw()
 
     def _draw(self):
@@ -1073,7 +1073,6 @@ class StyledCheckbutton(tk.Frame):
             fill = t["check_off"]
         else:
             fill = t["check_on"] if checked else t["check_off"]
-        self._box.create_rounded_rect = None  # placeholder
         # draw rounded square
         r = 4
         self._box.create_arc(1, 1, 1 + 2 * r, 1 + 2 * r, start=90, extent=90,
