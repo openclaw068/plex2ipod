@@ -1225,6 +1225,12 @@ class App:
         self._tree_loaded = set()  # item ids whose children have been fetched
         self._tree_pending_check = set()  # items whose children should auto-check on load
         self._artists_loaded = False
+        # Bumped every time the widget tree is torn down and rebuilt. Async
+        # library loads carry the value they started with and drop their
+        # results if it no longer matches: ttk hands out item ids like
+        # "I001" per widget, so a new Treeview reuses them and a late
+        # callback would otherwise insert under an unrelated node.
+        self._ui_generation = 0
 
         # Manage iPod tab state
         self._manage_checked = {}  # iid -> bool
@@ -2364,8 +2370,121 @@ class App:
         the window looks normal instead of near-black."""
         return self._transparent_key if self._use_transparency else self.t["bg"]
 
+    # ---- capturing and restoring UI state across a rebuild ----
+
+    def _stale(self, generation):
+        """True if a callback belongs to a widget tree we have since torn
+        down. Its item ids now refer to different rows, so its result has
+        to be dropped rather than inserted somewhere arbitrary."""
+        return generation is not None and generation != self._ui_generation
+
+    @staticmethod
+    def _capture_tree(tree, data_map, checked_map, loaded_set=None):
+        """Record a Treeview as nested plain data.
+
+        Keeps the "Loading..." placeholder rows too — they carry no entry
+        in data_map, and _trigger_lazy_load recognizes them by text, so a
+        restored branch still expands on demand.
+        """
+        def node(iid):
+            return {
+                "text": tree.item(iid, "text"),
+                "values": tuple(tree.item(iid, "values")),
+                "open": bool(tree.item(iid, "open")),
+                "info": data_map.get(iid),
+                "checked": bool(checked_map.get(iid)),
+                "loaded": bool(loaded_set) and iid in loaded_set,
+                "children": [node(child) for child in tree.get_children(iid)],
+            }
+        return [node(iid) for iid in tree.get_children()]
+
+    @staticmethod
+    def _restore_tree(tree, nodes, data_map, checked_map, loaded_set=None):
+        """Rebuild a Treeview from _capture_tree output, under fresh ids."""
+        def insert(parent, node):
+            iid = tree.insert(parent, "end", text=node["text"],
+                              values=node["values"], open=node["open"])
+            if node["info"] is not None:
+                data_map[iid] = node["info"]
+                checked_map[iid] = node["checked"]
+            if node["loaded"] and loaded_set is not None:
+                loaded_set.add(iid)
+            for child in node["children"]:
+                insert(iid, child)
+        for node in nodes:
+            insert("", node)
+
+    def _capture_ui_state(self):
+        """Snapshot everything the user has set up, so switching theme does
+        not silently discard it."""
+        return {
+            "url": self._url_var.get(),
+            "token": self._token_var.get(),
+            "ipod_root": self._ipod_root_var.get(),
+            "ipod_status": self._ipod_status_var.get(),
+            "status": self._status_var.get(),
+            "status_fg": self._status_label.cget("fg"),
+            "downsample": bool(self._downsample_var.get()),
+            "update_m3u": bool(self._update_m3u_var.get()),
+            "active_tab": self._active_tab.get(),
+            "progress": self._progress_val,
+            # Playlists: keep the rows and which of them were ticked.
+            "playlists": [dict(pl) for _var, pl in self._playlist_vars.values()],
+            "playlists_checked": {
+                pid for pid, (var, _pl) in self._playlist_vars.items()
+                if var.get()
+            },
+            "library": self._capture_tree(
+                self._tree, self._tree_data, self._tree_checked,
+                self._tree_loaded),
+            "artists_loaded": self._artists_loaded,
+            "manage": self._capture_tree(
+                self._manage_tree, self._manage_data, self._manage_checked),
+            "manage_loaded": self._manage_loaded,
+            "manage_status": self._manage_status_var.get(),
+        }
+
+    def _restore_ui_state(self, state):
+        """Put a _capture_ui_state snapshot back into freshly built widgets."""
+        self._url_var.set(state["url"])
+        self._token_var.set(state["token"])
+        self._ipod_root_var.set(state["ipod_root"])
+        self._ipod_status_var.set(state["ipod_status"])
+        self._downsample_var.set(state["downsample"])
+        self._update_m3u_var.set(state["update_m3u"])
+
+        self._status_var.set(state["status"])
+        try:
+            self._status_label.configure(fg=state["status_fg"])
+        except tk.TclError:
+            pass
+
+        if state["playlists"]:
+            self._populate_playlists(state["playlists"])
+            for pid, (var, _pl) in self._playlist_vars.items():
+                var.set(pid in state["playlists_checked"])
+
+        self._restore_tree(self._tree, state["library"], self._tree_data,
+                           self._tree_checked, self._tree_loaded)
+        self._artists_loaded = state["artists_loaded"]
+
+        self._restore_tree(self._manage_tree, state["manage"],
+                           self._manage_data, self._manage_checked)
+        self._manage_loaded = state["manage_loaded"]
+        self._manage_status_var.set(state["manage_status"])
+
+        # Selecting the tab after _manage_loaded is set, so the Manage tab
+        # does not kick off a fresh scan of a device we already listed.
+        self._select_tab(state["active_tab"])
+
+        self._progress_val = state["progress"]
+        self._draw_progress()
+
+        # The rebuild handed us default-enabled buttons; an operation may
+        # still be running underneath.
+        self._set_busy(self._busy or self._syncing)
+
     def _apply_theme(self):
-        t = self.t
         # Root + main use the window-background color (transparent sentinel
         # on Windows, theme bg elsewhere); cards paint their own colors.
         self.root.configure(bg=self._win_bg())
@@ -2382,7 +2501,12 @@ class App:
             except tk.TclError:
                 pass
 
-        # rebuild is the most reliable way with this many custom widgets
+        # Rebuilding is the most reliable way to recolor this many custom
+        # canvas widgets, but the widgets are the only disposable part —
+        # the user's selections are not. Snapshot, rebuild, put it back.
+        state = self._capture_ui_state()
+        self._ui_generation += 1
+
         for w in self._main.winfo_children():
             w.destroy()
         self._playlist_vars.clear()
@@ -2390,16 +2514,11 @@ class App:
         self._tree_checked.clear()
         self._tree_data.clear()
         self._tree_loaded.clear()
+        # Item ids are about to change, so anything queued against the old
+        # ones is meaningless; the generation bump drops those callbacks.
         self._tree_pending_check.clear()
-        self._artists_loaded = False
         self._manage_checked.clear()
         self._manage_data.clear()
-        self._manage_loaded = False
-
-        # save current field values
-        url = self._url_var.get()
-        token = self._token_var.get()
-        ipod_root = self._ipod_root_var.get()
 
         self._build_header()
         self._build_settings_card()
@@ -2412,13 +2531,7 @@ class App:
         # Re-apply Win11 chrome (dark/light title bar attribute)
         self._apply_win11_chrome()
 
-        self._url_var.set(url)
-        self._token_var.set(token)
-        self._ipod_root_var.set(ipod_root)
-
-        # re-connect if we had a connection
-        if self.plex and self._section_id:
-            threading.Thread(target=self._connect_worker, daemon=True).start()
+        self._restore_ui_state(state)
 
     # ---- connect ----
 
@@ -2675,16 +2788,19 @@ class App:
             return
         self._artists_loaded = True
         self._log_msg("Loading artists from library...")
-        threading.Thread(target=self._load_artists_worker, daemon=True).start()
+        threading.Thread(target=self._load_artists_worker,
+                         args=(self._ui_generation,), daemon=True).start()
 
-    def _load_artists_worker(self):
+    def _load_artists_worker(self, generation):
         try:
             artists = self.plex.get_artists(self._section_id)
-            self.root.after(0, self._populate_artists, artists)
+            self.root.after(0, self._populate_artists, artists, generation)
         except (URLError, HTTPError, OSError) as e:
             self.root.after(0, self._log_msg, f"Failed to load artists: {e}")
 
-    def _populate_artists(self, artists):
+    def _populate_artists(self, artists, generation=None):
+        if self._stale(generation):
+            return
         artists = sorted(artists, key=lambda a: sort_key(a["title"]))
         for a in artists:
             iid = self._tree.insert(
@@ -2699,14 +2815,17 @@ class App:
         item = self._tree.focus()
         self._trigger_lazy_load(item)
 
-    def _load_albums_worker(self, parent_iid, artist):
+    def _load_albums_worker(self, parent_iid, artist, generation):
         try:
             albums = self.plex.get_artist_albums(artist["key"])
-            self.root.after(0, self._populate_albums, parent_iid, albums)
+            self.root.after(0, self._populate_albums, parent_iid, albums,
+                            generation)
         except (URLError, HTTPError, OSError) as e:
             self.root.after(0, self._log_msg, f"Failed to load albums: {e}")
 
-    def _populate_albums(self, parent_iid, albums):
+    def _populate_albums(self, parent_iid, albums, generation=None):
+        if self._stale(generation) or not self._tree.exists(parent_iid):
+            return
         propagate = parent_iid in self._tree_pending_check
         albums = sorted(albums, key=lambda a: sort_key(a["title"]))
         for a in albums:
@@ -2725,14 +2844,17 @@ class App:
                 self._set_checked(child, True)
             self._tree_pending_check.discard(parent_iid)
 
-    def _load_tracks_worker(self, parent_iid, album):
+    def _load_tracks_worker(self, parent_iid, album, generation):
         try:
             tracks = self.plex.get_album_tracks(album["key"])
-            self.root.after(0, self._populate_tracks, parent_iid, tracks)
+            self.root.after(0, self._populate_tracks, parent_iid, tracks,
+                            generation)
         except (URLError, HTTPError, OSError) as e:
             self.root.after(0, self._log_msg, f"Failed to load tracks: {e}")
 
-    def _populate_tracks(self, parent_iid, tracks):
+    def _populate_tracks(self, parent_iid, tracks, generation=None):
+        if self._stale(generation) or not self._tree.exists(parent_iid):
+            return
         propagate = parent_iid in self._tree_pending_check
         tracks = sorted(tracks, key=lambda t: sort_key(t["title"]))
         for t in tracks:
@@ -2795,12 +2917,14 @@ class App:
         self._tree.delete(children[0])
         if info["type"] == "artist":
             threading.Thread(
-                target=self._load_albums_worker, args=(item, info["data"]),
+                target=self._load_albums_worker,
+                args=(item, info["data"], self._ui_generation),
                 daemon=True,
             ).start()
         elif info["type"] == "album":
             threading.Thread(
-                target=self._load_tracks_worker, args=(item, info["data"]),
+                target=self._load_tracks_worker,
+                args=(item, info["data"], self._ui_generation),
                 daemon=True,
             ).start()
 
