@@ -5,6 +5,7 @@ from the active theme dict.
 """
 
 import tkinter as tk
+import tkinter.font as tkfont
 
 
 class GlassCard(tk.Canvas):
@@ -78,13 +79,27 @@ class StyledEntry(tk.Entry):
 class StyledButton(tk.Canvas):
     """A modern rounded button drawn on canvas."""
 
+    # Horizontal breathing room either side of the label.
+    PAD_X = 14
+    # Icon-only buttons still need to be clickable.
+    MIN_WIDTH = 30
+
     def __init__(self, parent, text, theme, command=None,
                  bg=None, hover_bg=None, fg=None, width=120, height=28,
                  radius=8, font=("Segoe UI", 10, "bold"), **kw):
+        # The canvas is sized to the label rather than to the width the
+        # caller asked for. Those widths were measured against Segoe UI on
+        # Windows; every other platform substitutes a different family with
+        # different metrics, and the text was being clipped by its own
+        # canvas. `width` is kept as a floor so icon-only buttons stay
+        # square-ish.
+        width = max(self._natural_width(text, font), min(width,
+                                                         self.MIN_WIDTH))
         super().__init__(parent, width=width, height=height,
                          highlightthickness=0, bd=0,
                          bg=parent.cget("bg") if isinstance(parent, tk.Widget) else theme["bg"],
                          **kw)
+        self._width = width
         self._text = text
         self._command = command
         self._bg = bg or theme["accent"]
@@ -101,6 +116,17 @@ class StyledButton(tk.Canvas):
         self.bind("<Enter>", lambda e: self._draw(self._hover_bg) if not self._disabled else None)
         self.bind("<Leave>", lambda e: self._draw(self._bg) if not self._disabled else None)
         self.bind("<Button-1>", self._on_click)
+
+    @classmethod
+    def _natural_width(cls, text, font):
+        """Width needed to show `text` in `font` without clipping."""
+        try:
+            measured = tkfont.Font(font=font).measure(text)
+        except tk.TclError:
+            # No Tk yet (or a font Tk cannot resolve) — fall back to a
+            # rough per-character estimate rather than failing to build.
+            measured = int(len(text) * 7.5)
+        return max(measured + 2 * cls.PAD_X, cls.MIN_WIDTH)
 
     def _draw(self, color):
         self.delete("all")

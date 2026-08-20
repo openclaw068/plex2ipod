@@ -961,3 +961,177 @@ class CapacityReadoutTests(unittest.TestCase):
         self.assertTrue(hasattr(self.app, "_capacity_bar"))
         self.app._recompute_capacity()
         self.assertIn("free of", self.app._capacity_var.get())
+
+
+PRECHECK_ARTISTS = [{"title": "Radiohead", "key": "/k/rh", "rating_key": "1"},
+                    {"title": "Portishead", "key": "/k/pt", "rating_key": "2"}]
+PRECHECK_ALBUMS = {
+    "/k/rh": [{"title": "Kid A", "key": "/a/kida", "rating_key": "1",
+               "year": ""},
+              {"title": "Amnesiac", "key": "/a/amn", "rating_key": "2",
+               "year": ""}],
+    "/k/pt": [{"title": "Dummy", "key": "/a/dum", "rating_key": "3",
+               "year": ""}],
+}
+
+
+def _pt(title, album, filename, artist="Radiohead"):
+    return {"title": title, "artist": artist, "album": album,
+            "duration_ms": 1, "part_key": "/p/%s/%s" % (album, filename),
+            "filename": filename, "container": "flac", "size": 4000}
+
+
+PRECHECK_TRACKS = {
+    "/a/kida": [_pt("Everything", "Kid A", "01 Everything.flac"),
+                _pt("Kid A", "Kid A", "02 Kid A.flac")],
+    "/a/amn": [_pt("Packt", "Amnesiac", "01 Packt.flac"),
+               _pt("Pyramid", "Amnesiac", "02 Pyramid.flac")],
+    "/a/dum": [_pt("Roads", "Dummy", "01 Roads.flac", "Portishead")],
+}
+
+
+@requires_tk
+class PrecheckTests(unittest.TestCase):
+    """On connect the tree should already show what is on the device:
+    fully-synced albums ticked, partly-synced ones half-ticked, and
+    artists that are not there left alone and never loaded."""
+
+    def setUp(self):
+        import shutil, tempfile
+        self.p2i = app_module()
+        self._cfg = TempAppDir(self.p2i)
+        self._cfg.__enter__()
+        self.addCleanup(lambda: self._cfg.__exit__(None, None, None))
+
+        # Kid A complete, Amnesiac half, Portishead absent.
+        self.ipod = tempfile.mkdtemp(prefix="plex2ipod-precheck-")
+        self.addCleanup(lambda: shutil.rmtree(self.ipod, ignore_errors=True))
+        music = os.path.join(self.ipod, "Music")
+        for album, names in (("Kid A", ["01 Everything.flac",
+                                        "02 Kid A.flac"]),
+                             ("Amnesiac", ["01 Packt.flac"])):
+            folder = os.path.join(music, "Radiohead", album)
+            os.makedirs(folder)
+            for name in names:
+                with open(os.path.join(folder, name), "wb") as fh:
+                    fh.write(b"\0" * 4000)
+        os.makedirs(os.path.join(self.ipod, "Playlists"))
+        with open(os.path.join(self.ipod, "Playlists", "Workout.m3u"),
+                  "w") as fh:
+            fh.write("#EXTM3U\n")
+
+        self.stub = StubPlex(playlists=PLAYLISTS, artists=PRECHECK_ARTISTS,
+                             albums=PRECHECK_ALBUMS,
+                             album_tracks=PRECHECK_TRACKS)
+        self._real = self.p2i.app.PlexClient
+        self.p2i.app.PlexClient = lambda *a, **k: self.stub
+        self.addCleanup(self._restore)
+
+        self.app = self.p2i.App()
+        self.app.root.geometry("900x700" + OFFSCREEN)
+        self.app._ipod_root_var.set(self.ipod)
+        self.app.root.update()
+        self.addCleanup(lambda: destroy_tk(self.app.root))
+        self._connect()
+
+    def _restore(self):
+        self.p2i.app.PlexClient = self._real
+
+    def _connect(self):
+        app = self.app
+
+        def step():
+            app.plex = self.stub
+            app._select_tab(1)
+            app._on_connected(PLAYLISTS, "3")
+            app.root.after(2500, app.root.quit)
+
+        app.root.after(100, step)
+        app.root.mainloop()
+
+    def row(self, label, parent=""):
+        for iid in self.app._tree.get_children(parent):
+            if label in self.app._tree.item(iid, "text"):
+                return iid
+        return None
+
+    def mark(self, iid):
+        return self.app._tree.item(iid, "text")[0]
+
+    def test_a_fully_synced_album_is_ticked(self):
+        album = self.row("Kid A", self.row("Radiohead"))
+        self.assertEqual(self.mark(album), "☑")
+
+    def test_a_partly_synced_album_is_half_ticked(self):
+        album = self.row("Amnesiac", self.row("Radiohead"))
+        self.assertEqual(self.mark(album), "☒")
+
+    def test_the_artist_reflects_its_albums(self):
+        self.assertEqual(self.mark(self.row("Radiohead")), "☒")
+
+    def test_present_tracks_are_ticked_and_absent_ones_are_not(self):
+        album = self.row("Amnesiac", self.row("Radiohead"))
+        marks = {self.app._tree.item(t, "text")[2:]: self.mark(t)
+                 for t in self.app._tree.get_children(album)}
+        self.assertEqual(marks, {"Packt": "☑", "Pyramid": "☐"})
+
+    def test_an_artist_not_on_the_device_is_untouched(self):
+        portishead = self.row("Portishead")
+        self.assertEqual(self.mark(portishead), "☐")
+
+    def test_an_artist_not_on_the_device_is_not_loaded(self):
+        # It must not cost a Plex round trip just to leave it alone.
+        portishead = self.row("Portishead")
+        children = self.app._tree.get_children(portishead)
+        self.assertEqual(
+            [self.app._tree.item(c, "text") for c in children], ["Loading..."])
+
+    def test_the_baseline_is_exactly_what_is_on_the_device(self):
+        self.assertEqual(sorted(self.app._baseline_paths), [
+            "radiohead/amnesiac/01 packt.flac",
+            "radiohead/kid a/01 everything.flac",
+            "radiohead/kid a/02 kid a.flac"])
+
+    def test_a_playlist_on_the_device_is_ticked(self):
+        var, _pl = self.app._playlist_vars["1"]
+        self.assertTrue(var.get())
+        self.assertIn("1", self.app._baseline_playlists)
+
+    def test_gathering_returns_each_track_once(self):
+        gathered = self.app._gather_library_tracks()
+        names = sorted(t["filename"] for t in gathered)
+        self.assertEqual(names, ["01 Everything.flac", "01 Packt.flac",
+                                 "02 Kid A.flac"])
+
+    def test_nothing_is_queued_for_deletion_before_the_user_unticks(self):
+        self.assertEqual(self.app._pending_deletions(), ([], []))
+
+    def test_unticking_an_album_queues_its_tracks(self):
+        album = self.row("Kid A", self.row("Radiohead"))
+        self.app._set_checked(album, False)
+        tracks, _playlists = self.app._pending_deletions()
+        self.assertEqual(sorted(os.path.basename(p) for p in tracks),
+                         ["01 Everything.flac", "02 Kid A.flac"])
+
+    def test_unticking_the_artist_queues_everything_it_had(self):
+        self.app._set_checked(self.row("Radiohead"), False)
+        tracks, _playlists = self.app._pending_deletions()
+        self.assertEqual(len(tracks), 3)
+
+    def test_ticking_a_missing_track_does_not_queue_a_deletion(self):
+        album = self.row("Amnesiac", self.row("Radiohead"))
+        pyramid = self.row("Pyramid", album)
+        self.app._set_checked(pyramid, True)
+        self.assertEqual(self.app._pending_deletions(), ([], []))
+
+    def test_precheck_runs_only_once(self):
+        before = sorted(self.app._baseline_paths)
+        self.app._maybe_precheck()
+        self.assertEqual(sorted(self.app._baseline_paths), before)
+
+    def test_the_marks_survive_a_theme_toggle(self):
+        self.app._toggle_theme()
+        self.app.root.update()
+        self.assertEqual(self.mark(self.row("Radiohead")), "☒")
+        album = self.row("Kid A", self.row("Radiohead"))
+        self.assertEqual(self.mark(album), "☑")

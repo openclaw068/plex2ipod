@@ -366,7 +366,7 @@ class IPodTestCase(unittest.TestCase):
         app._ipod_status_var = FakeVar("")
         app._manage_status_var = FakeVar("")
         app._update_m3u_var = FakeVar(True)
-        # Capacity accounting state, normally set up in App.__init__.
+        # Capacity and pre-check state, normally set up in App.__init__.
         app._playlist_vars = {}
         app._playlist_track_cache = {}
         app._playlist_fetching = set()
@@ -374,6 +374,11 @@ class IPodTestCase(unittest.TestCase):
         app._indexed_root = None
         app._capacity = None
         app._capacity_after = None
+        app._tree_partial = set()
+        app._tree_pending_precheck = set()
+        app._baseline_paths = set()
+        app._baseline_playlists = set()
+        app._prechecked = False
         for key, value in attrs.items():
             setattr(app, key, value)
         return app
