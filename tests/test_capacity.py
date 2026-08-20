@@ -130,8 +130,11 @@ class IpodIndexTests(IPodTestCase):
         captured = {}
         app._set_ipod_index = lambda index: captured.setdefault("i", index)
         app._ipod_index_worker(self.ipod.music_dir)
-        self.assertEqual(captured["i"],
-                         {"radiohead/kid a/01.flac", "radiohead/kid a/02.flac"})
+        self.assertEqual(sorted(captured["i"]),
+                         ["radiohead/kid a/01.flac", "radiohead/kid a/02.flac"])
+        # the mapping must point at the real path, not the lowercased one
+        for rel, actual in captured["i"].items():
+            self.assertTrue(os.path.isfile(actual), actual)
 
     def test_zero_byte_files_are_not_indexed(self):
         # They are what a failed write leaves behind, and syncing has to
@@ -142,14 +145,14 @@ class IpodIndexTests(IPodTestCase):
         captured = {}
         app._set_ipod_index = lambda index: captured.setdefault("i", index)
         app._ipod_index_worker(self.ipod.music_dir)
-        self.assertEqual(captured["i"], {"a/b/good.flac"})
+        self.assertEqual(sorted(captured["i"]), ["a/b/good.flac"])
 
     def test_a_missing_music_folder_yields_an_empty_index(self):
         app = self.bare_app()
         captured = {}
         app._set_ipod_index = lambda index: captured.setdefault("i", index)
         app._ipod_index_worker("/nonexistent/xyzzy")
-        self.assertEqual(captured["i"], set())
+        self.assertEqual(captured["i"], {})
 
 
 class CapacityConfirmTests(IPodTestCase):

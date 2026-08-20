@@ -13,7 +13,8 @@ from xml.etree import ElementTree
 
 from .audio import AudioConverter
 from .config import CONFIG_DEFAULTS, ConfigManager
-from .naming import find_path_collisions, ipod_rel_path, sort_key
+from .naming import (find_path_collisions, ipod_rel_path,
+                     sanitize_component, sort_key)
 from .paths import resource_dirs
 from .platform_io import (IS_WINDOWS, detect_ipod_roots, disk_usage,
                           eject_volume, list_ipod_roots, music_folder_name)
@@ -55,6 +56,14 @@ class App:
         # Capacity accounting. The playlist cache holds track lists fetched
         # purely to size a selection; the iPod index is the set of relative
         # paths already on the device, so those tracks cost no new space.
+        self._tree_partial = set()      # containers only partly ticked
+        # Pre-checking: rows queued for a deep load so what is really on
+        # the device can be ticked, and the resulting baseline. Only paths
+        # in the baseline may ever be deleted by a sync.
+        self._tree_pending_precheck = set()
+        self._baseline_paths = set()
+        self._baseline_playlists = set()
+        self._prechecked = False
         self._playlist_track_cache = {}
         self._playlist_fetching = set()
         self._ipod_index = None
@@ -949,7 +958,7 @@ class App:
         self._tab_frames.append(manage_frame)
 
         m_btn_row = tk.Frame(manage_frame, bg=self.t["bg_card"])
-        m_btn_row.pack(fill="x", pady=(0, 8))
+        m_btn_row.pack(fill="x", pady=(0, 6))
 
         self._manage_refresh_btn = StyledButton(
             m_btn_row, "\u21bb  Refresh", self.t,
@@ -976,8 +985,15 @@ class App:
         )
         self._manage_desel_btn.pack(side="left", padx=(0, 6))
 
+        # Second row for the operations. All six on one row needed more
+        # width than the tab has at the minimum window size, and Tk
+        # resolves that by squeezing the last button until its label is
+        # unreadable rather than by wrapping.
+        m_op_row = tk.Frame(manage_frame, bg=self.t["bg_card"])
+        m_op_row.pack(fill="x", pady=(0, 8))
+
         self._rebuild_db_btn = StyledButton(
-            m_btn_row, "\u21ba  Rebuild Rockbox DB", self.t,
+            m_op_row, "\u21ba  Rebuild Rockbox DB", self.t,
             command=self._on_rebuild_rockbox_db,
             bg=self.t["accent2"], hover_bg=self.t["border_light"],
             fg=self.t["fg"], width=170, height=28, radius=6,
@@ -986,7 +1002,7 @@ class App:
         self._rebuild_db_btn.pack(side="left", padx=(0, 6))
 
         self._downsample_existing_btn = StyledButton(
-            m_btn_row, "\u21e9  Downsample 24-bit Tracks", self.t,
+            m_op_row, "\u21e9  Downsample 24-bit Tracks", self.t,
             command=self._on_downsample_existing,
             bg=self.t["accent2"], hover_bg=self.t["border_light"],
             fg=self.t["fg"], width=210, height=28, radius=6,
@@ -995,7 +1011,7 @@ class App:
         self._downsample_existing_btn.pack(side="left", padx=(0, 6))
 
         self._verify_repair_btn = StyledButton(
-            m_btn_row, "\U0001f527  Verify && Repair", self.t,
+            m_op_row, "\U0001f527  Verify && Repair", self.t,
             command=self._on_verify_repair,
             bg=self.t["accent2"], hover_bg=self.t["border_light"],
             fg=self.t["fg"], width=160, height=28, radius=6,
@@ -1003,12 +1019,15 @@ class App:
         )
         self._verify_repair_btn.pack(side="left", padx=(0, 6))
 
+        # The status line gets its own row. Packed onto the button row it
+        # was competing with six buttons for horizontal space and Tk
+        # squeezed it down to a single pixel, so it was never readable.
         self._manage_status_var = tk.StringVar(value="")
         tk.Label(
-            m_btn_row, textvariable=self._manage_status_var,
+            manage_frame, textvariable=self._manage_status_var,
             bg=self.t["bg_card"], fg=self.t["fg_dim"],
-            font=("Segoe UI", 9),
-        ).pack(side="left", padx=(12, 0))
+            font=("Segoe UI", 9), anchor="w",
+        ).pack(fill="x", pady=(0, 6))
 
         # Action row packed FIRST with side="bottom" so it's always reserved
         # at the bottom of the tab even when the tree expands.
@@ -1228,7 +1247,8 @@ class App:
         return generation is not None and generation != self._ui_generation
 
     @staticmethod
-    def _capture_tree(tree, data_map, checked_map, loaded_set=None):
+    def _capture_tree(tree, data_map, checked_map, loaded_set=None,
+                      partial_set=None):
         """Record a Treeview as nested plain data.
 
         Keeps the "Loading..." placeholder rows too — they carry no entry
@@ -1243,12 +1263,14 @@ class App:
                 "info": data_map.get(iid),
                 "checked": bool(checked_map.get(iid)),
                 "loaded": bool(loaded_set) and iid in loaded_set,
+                "partial": bool(partial_set) and iid in partial_set,
                 "children": [node(child) for child in tree.get_children(iid)],
             }
         return [node(iid) for iid in tree.get_children()]
 
     @staticmethod
-    def _restore_tree(tree, nodes, data_map, checked_map, loaded_set=None):
+    def _restore_tree(tree, nodes, data_map, checked_map, loaded_set=None,
+                      partial_set=None):
         """Rebuild a Treeview from _capture_tree output, under fresh ids."""
         def insert(parent, node):
             iid = tree.insert(parent, "end", text=node["text"],
@@ -1258,6 +1280,8 @@ class App:
                 checked_map[iid] = node["checked"]
             if node["loaded"] and loaded_set is not None:
                 loaded_set.add(iid)
+            if node.get("partial") and partial_set is not None:
+                partial_set.add(iid)
             for child in node["children"]:
                 insert(iid, child)
         for node in nodes:
@@ -1285,7 +1309,7 @@ class App:
             },
             "library": self._capture_tree(
                 self._tree, self._tree_data, self._tree_checked,
-                self._tree_loaded),
+                self._tree_loaded, self._tree_partial),
             "artists_loaded": self._artists_loaded,
             "manage": self._capture_tree(
                 self._manage_tree, self._manage_data, self._manage_checked),
@@ -1314,7 +1338,8 @@ class App:
                 var.set(pid in state["playlists_checked"])
 
         self._restore_tree(self._tree, state["library"], self._tree_data,
-                           self._tree_checked, self._tree_loaded)
+                           self._tree_checked, self._tree_loaded,
+                           self._tree_partial)
         self._artists_loaded = state["artists_loaded"]
 
         self._restore_tree(self._manage_tree, state["manage"],
@@ -1362,6 +1387,7 @@ class App:
         self._playlist_vars.clear()
         self._playlist_widgets.clear()
         self._tree_checked.clear()
+        self._tree_partial.clear()
         self._tree_data.clear()
         self._tree_loaded.clear()
         # Item ids are about to change, so anything queued against the old
@@ -1581,20 +1607,31 @@ class App:
 
     def _on_connected(self, playlists, section_id):
         self._section_id = section_id
-        # Sizes were cached against the previous server/session.
-        self._playlist_track_cache.clear()
-        self._playlist_fetching.clear()
         count_text = f"{len(playlists)} playlists"
         self._status_var.set(f"Connected  \u2022  {count_text}")
         self._status_label.configure(fg=self.t["success"])
-        self._populate_playlists(playlists)
+
+        # Clear everything built against the previous server or session
+        # first, so nothing below is undone by a later reset.
+        self._playlist_track_cache.clear()
+        self._playlist_fetching.clear()
         self._artists_loaded = False
         for item in self._tree.get_children():
             self._tree.delete(item)
         self._tree_checked.clear()
+        self._tree_partial.clear()
         self._tree_data.clear()
         self._tree_loaded.clear()
         self._tree_pending_check.clear()
+        self._tree_pending_precheck.clear()
+        self._baseline_paths = set()
+        self._baseline_playlists = set()
+        self._prechecked = False
+
+        # Now repopulate and reflect what is already on the device.
+        self._maybe_refresh_ipod_index(force=True)
+        self._populate_playlists(playlists)
+        self._precheck_playlists()
 
         # The artist load normally fires from _select_tab when the user
         # first opens the Library tab. If that tab is *already* the active
@@ -1666,6 +1703,7 @@ class App:
             self._tree_data[iid] = {"type": "artist", "data": a}
             self._tree.insert(iid, "end", text="Loading...")
         self._log_msg(f"Loaded {len(artists)} artists.")
+        self._maybe_precheck()
 
     def _on_tree_open(self, event):
         item = self._tree.focus()
@@ -1700,6 +1738,9 @@ class App:
                 self._set_checked(child, True)
             self._tree_pending_check.discard(parent_iid)
             self._schedule_capacity_update()
+        if parent_iid in self._tree_pending_precheck:
+            self._tree_pending_precheck.discard(parent_iid)
+            self._precheck_albums(parent_iid)
 
     def _load_tracks_worker(self, parent_iid, album, generation):
         try:
@@ -1728,6 +1769,9 @@ class App:
             for child in self._tree.get_children(parent_iid):
                 self._set_checked(child, True)
             self._tree_pending_check.discard(parent_iid)
+        if parent_iid in self._tree_pending_precheck:
+            self._tree_pending_precheck.discard(parent_iid)
+            self._precheck_tracks(parent_iid)
         self._schedule_capacity_update()
 
     def _on_tree_click(self, event):
@@ -1738,16 +1782,50 @@ class App:
         self._set_checked(item, new_state)
         self._schedule_capacity_update()
 
-    def _set_checked(self, item, state):
-        self._tree_checked[item] = state
+    CHECK_MARKS = {True: "\u2611 ", False: "\u2610 ", "partial": "\u2612 "}
+
+    def _set_row_mark(self, item, state):
+        """Repaint one row's checkbox glyph. `state` is True, False or
+        "partial"; partial means some but not all descendants are ticked."""
         text = self._tree.item(item, "text")
-        # strip old checkbox prefix
-        for prefix in ("\u2611 ", "\u2610 ", "\u2612 "):
+        for prefix in self.CHECK_MARKS.values():
             if text.startswith(prefix):
                 text = text[len(prefix):]
                 break
-        new_prefix = "\u2611 " if state else "\u2610 "
-        self._tree.item(item, text=new_prefix + text)
+        self._tree.item(item, text=self.CHECK_MARKS[state] + text)
+
+    def _refresh_ancestor_marks(self, item):
+        """Walk up from a leaf, showing each container as fully ticked,
+        partly ticked or empty according to its descendants."""
+        parent = self._tree.parent(item)
+        while parent:
+            children = [c for c in self._tree.get_children(parent)
+                        if c in self._tree_checked]
+            if children:
+                ticked = sum(1 for c in children
+                             if self._tree_checked.get(c)
+                             or c in self._tree_partial)
+                fully = sum(1 for c in children
+                            if self._tree_checked.get(c)
+                            and c not in self._tree_partial)
+                if fully == len(children):
+                    state = True
+                elif ticked:
+                    state = "partial"
+                else:
+                    state = False
+                self._tree_checked[parent] = bool(state)
+                if state == "partial":
+                    self._tree_partial.add(parent)
+                else:
+                    self._tree_partial.discard(parent)
+                self._set_row_mark(parent, state)
+            parent = self._tree.parent(parent)
+
+    def _set_checked(self, item, state):
+        self._tree_checked[item] = state
+        self._tree_partial.discard(item)
+        self._set_row_mark(item, bool(state))
 
         info = self._tree_data.get(item)
         item_type = info["type"] if info else None
@@ -2809,6 +2887,117 @@ class App:
 
         return not (has_sr and has_dur)
 
+    # ---- reflecting what is already on the iPod ----
+
+    def _ipod_folders(self, depth):
+        """Folder paths present on the device, lowercased.
+
+        depth 1 gives artist folders, depth 2 gives "artist/album".
+        """
+        if not self._ipod_index:
+            return set()
+        found = set()
+        for rel in self._ipod_index:
+            parts = rel.split("/")
+            if len(parts) > depth:
+                found.add("/".join(parts[:depth]))
+        return found
+
+    def _maybe_precheck(self):
+        """Tick what is already on the iPod, once we know both sides.
+
+        Needs the artist rows loaded and the device indexed. Runs once per
+        connection; the baseline it records is what a later sync is
+        allowed to delete.
+        """
+        # Reached from the device-index worker, which can land before the
+        # tree exists or after the window has gone.
+        tree = getattr(self, "_tree", None)
+        if (tree is None or self._prechecked or self._ipod_index is None
+                or not tree.get_children()):
+            return
+        self._prechecked = True
+        artist_folders = self._ipod_folders(1)
+        if not artist_folders:
+            self._log_msg("Nothing on the iPod yet — starting with an "
+                          "empty selection.")
+            return
+
+        queued = 0
+        for iid in self._tree.get_children():
+            info = self._tree_data.get(iid)
+            if not info or info["type"] != "artist":
+                continue
+            folder = sanitize_component(info["data"]["title"]).lower()
+            if folder not in artist_folders:
+                continue
+            queued += 1
+            self._tree_pending_precheck.add(iid)
+            self._trigger_lazy_load(iid)
+        if queued:
+            self._log_msg(
+                f"Found {queued} artist(s) already on the iPod — loading "
+                f"them so what is there shows up ticked.")
+        else:
+            self._log_msg(
+                "The iPod has music, but none of it matches an artist in "
+                "this Plex library.")
+
+    def _precheck_albums(self, parent_iid):
+        """An artist queued for pre-check just got its albums: descend into
+        the ones that exist on the device."""
+        album_folders = self._ipod_folders(2)
+        artist_info = self._tree_data.get(parent_iid)
+        if not artist_info:
+            return
+        artist_folder = sanitize_component(
+            artist_info["data"]["title"]).lower()
+        for child in self._tree.get_children(parent_iid):
+            info = self._tree_data.get(child)
+            if not info or info["type"] != "album":
+                continue
+            folder = sanitize_component(info["data"]["title"]).lower()
+            if f"{artist_folder}/{folder}" in album_folders:
+                self._tree_pending_precheck.add(child)
+                self._trigger_lazy_load(child)
+
+    def _precheck_tracks(self, parent_iid):
+        """An album queued for pre-check just got its tracks: tick the ones
+        whose file is really on the device, and record them as the baseline
+        a sync may delete."""
+        ticked = 0
+        for child in self._tree.get_children(parent_iid):
+            info = self._tree_data.get(child)
+            if not info or info["type"] != "track":
+                continue
+            rel = ipod_rel_path(info["data"]).lower()
+            if rel in self._ipod_index:
+                self._tree_checked[child] = True
+                self._tree_partial.discard(child)
+                self._set_row_mark(child, True)
+                self._baseline_paths.add(rel)
+                ticked += 1
+        if ticked:
+            self._refresh_ancestor_marks(
+                self._tree.get_children(parent_iid)[0])
+        self._schedule_capacity_update()
+
+    def _precheck_playlists(self):
+        """Tick playlists whose .m3u is already on the device."""
+        root = self._ipod_root()
+        if not root or not os.path.isdir(root):
+            return
+        try:
+            on_ipod = {name.lower() for name
+                       in os.listdir(os.path.join(root, "Playlists"))}
+        except OSError:
+            return
+        for pid, (var, pl) in self._playlist_vars.items():
+            filename = sanitize_component(pl["title"]).lower() + ".m3u"
+            if filename in on_ipod:
+                self._baseline_playlists.add(pid)
+                var.set(True)
+
     # ---- iPod capacity ----
 
     def _schedule_capacity_update(self, delay=250):
@@ -2923,7 +3112,15 @@ class App:
                          args=(music_root,), daemon=True).start()
 
     def _ipod_index_worker(self, music_root):
-        index = set()
+        """Map each file on the device from its lowercased relative path to
+        its real one.
+
+        Matching has to ignore case, because Plex metadata and the FAT32
+        directory can disagree on it. Deleting does not: on a
+        case-sensitive filesystem the lowercased form names nothing, so
+        the real path has to be carried alongside.
+        """
+        index = {}
         try:
             for dirpath, _dirs, files in os.walk(music_root):
                 for name in files:
@@ -2934,7 +3131,7 @@ class App:
                     except OSError:
                         continue
                     rel = os.path.relpath(full, music_root)
-                    index.add(rel.replace(os.sep, "/").lower())
+                    index[rel.replace(os.sep, "/").lower()] = full
         except OSError:
             pass
         self.root.after(0, self._set_ipod_index, index)
@@ -2942,6 +3139,7 @@ class App:
     def _set_ipod_index(self, index):
         self._ipod_index = index
         self._schedule_capacity_update()
+        self._maybe_precheck()
 
     # -- playlist sizes --
 
@@ -2980,6 +3178,68 @@ class App:
         self._schedule_capacity_update()
 
     # ---- sync ----
+
+    def _selected_paths(self):
+        """Relative paths of every ticked track, from both tabs."""
+        paths = set()
+        for pid, (var, _pl) in self._playlist_vars.items():
+            if not var.get():
+                continue
+            for track in self._playlist_track_cache.get(pid) or ():
+                paths.add(ipod_rel_path(track).lower())
+        for track in self._gather_library_tracks():
+            paths.add(ipod_rel_path(track).lower())
+        return paths
+
+    def _pending_deletions(self):
+        """(track file paths, playlist file paths) the user has un-ticked.
+
+        Only ever drawn from the baseline — the things this session ticked
+        for the user because they were already on the device. Anything the
+        app never ticked is never a deletion candidate, so an artist whose
+        load failed, or music the Plex library does not know about, cannot
+        be removed by a sync.
+        """
+        selected = self._selected_paths()
+        index = self._ipod_index or {}
+        tracks = []
+        for rel in sorted(self._baseline_paths - selected):
+            actual = index.get(rel)
+            if actual:
+                tracks.append(actual)
+
+        playlist_dir = os.path.join(self._ipod_root(), "Playlists")
+        playlists = []
+        for pid in sorted(self._baseline_playlists):
+            entry = self._playlist_vars.get(pid)
+            if entry is None or entry[0].get():
+                continue
+            name = sanitize_component(entry[1]["title"]) + ".m3u"
+            playlists.append(os.path.join(playlist_dir, name))
+        return tracks, playlists
+
+    def _confirm_deletions(self, to_add, del_tracks, del_playlists):
+        """Single confirmation covering both halves of the sync."""
+        if not del_tracks and not del_playlists:
+            return True
+        freed = sum(self._safe_size(path) for path in del_tracks)
+        lines = [f"Add:     {len(to_add)} track(s)"]
+        lines.append(f"DELETE:  {len(del_tracks)} track(s) "
+                     f"({self._human_size(freed)})")
+        if del_playlists:
+            lines.append(f"         {len(del_playlists)} playlist file(s)")
+        preview = [os.path.basename(p) for p in del_tracks[:8]]
+        preview += [os.path.basename(p) for p in del_playlists[:3]]
+        remaining = (len(del_tracks) + len(del_playlists)) - len(preview)
+        if remaining > 0:
+            preview.append(f"...and {remaining} more")
+        return messagebox.askyesno(
+            "Confirm sync",
+            "\n".join(lines)
+            + "\n\nThese were on the iPod and are no longer ticked, so they "
+              "will be deleted after the new tracks are copied:\n\n"
+            + "\n".join("  " + name for name in preview)
+            + "\n\nThis cannot be undone. Continue?")
 
     def _confirm_capacity(self):
         """Ask before starting a sync that cannot finish.
@@ -3033,6 +3293,12 @@ class App:
         if not self._confirm_capacity():
             return
 
+        del_tracks, del_playlists = self._pending_deletions()
+        if not self._confirm_deletions(self._gather_library_tracks(),
+                                       del_tracks, del_playlists):
+            self._log_msg("Sync cancelled.")
+            return
+
         self.cfg["ipod_root"] = root
         self.cfg["downsample_on_sync"] = bool(self._downsample_var.get())
         self.cfg_mgr.save(self.cfg)
@@ -3049,6 +3315,7 @@ class App:
         ]
         lib_tracks = list(self._gather_library_tracks())
         downsample = bool(self._downsample_var.get()) and self.audio.available
+        deletions = (list(del_tracks), list(del_playlists))
 
         self._syncing = True
         self._cancel = False
@@ -3060,7 +3327,7 @@ class App:
 
         threading.Thread(
             target=self._sync_worker,
-            args=(selected_playlists, lib_tracks, downsample),
+            args=(selected_playlists, lib_tracks, downsample, deletions),
             daemon=True,
         ).start()
 
@@ -3111,9 +3378,11 @@ class App:
         except Exception as e:
             self.root.after(0, self._log_msg, f"Eject error: {e}")
 
-    def _sync_worker(self, selected_playlists, lib_tracks, downsample):
+    def _sync_worker(self, selected_playlists, lib_tracks, downsample,
+                     deletions=None):
         try:
-            self._do_sync(selected_playlists, lib_tracks, downsample)
+            self._do_sync(selected_playlists, lib_tracks, downsample,
+                          deletions)
         except Exception as e:
             self.root.after(0, self._log_msg, f"Sync error: {e}")
         finally:
@@ -3143,7 +3412,8 @@ class App:
                             f"  ...and {len(collisions) - limit} more")
         return len(collisions)
 
-    def _do_sync(self, selected_playlists, lib_tracks, downsample):
+    def _do_sync(self, selected_playlists, lib_tracks, downsample,
+                 deletions=None):
         playlist_tracks = {}
         all_tracks = {}    # dedup key -> track (so a song in two playlists
                            # is only downloaded once)
@@ -3168,7 +3438,13 @@ class App:
             all_tracks[key(t)] = t
 
         if not all_tracks:
-            self.root.after(0, self._log_msg, "Nothing selected to sync.")
+            # Un-ticking everything is a valid request: there is nothing to
+            # copy, but the removals still have to run.
+            removed = self._apply_deletions(deletions)
+            self.root.after(
+                0, self._log_msg,
+                f"Done. {removed} removed." if removed
+                else "Nothing selected to sync.")
             return
 
         self._warn_about_collisions(selected)
@@ -3303,14 +3579,18 @@ class App:
             except OSError as e:
                 self.root.after(0, self._log_msg, f"Error writing {name}.m3u: {e}")
 
+        removed = self._apply_deletions(deletions)
+
         skipped = len(already_exist)
         conv_suffix = f" ({converted} downsampled)" if converted else ""
         fail_suffix = f", {failed} failed" if failed else ""
         full_suffix = " \u2014 iPod filled up" if filled else ""
+        del_suffix = f", {removed} removed" if removed else ""
         self.root.after(
             0, self._log_msg,
             f"Done. {copied} downloaded{conv_suffix}, {skipped} skipped"
-            f"{fail_suffix}, {written} playlist(s) written{full_suffix}.",
+            f"{fail_suffix}{del_suffix}, {written} playlist(s) "
+            f"written{full_suffix}.",
         )
         if filled:
             self.root.after(0, lambda: messagebox.showinfo(
@@ -3321,27 +3601,67 @@ class App:
                 "Free some space from the Manage iPod tab, then sync again "
                 "to continue."))
 
+    def _apply_deletions(self, deletions):
+        """Remove what the user un-ticked, after the additions have landed.
+
+        Deletions run last so that a track which moved between albums is
+        written to its new home before the old copy goes.
+        """
+        if not deletions:
+            return 0
+        del_tracks, del_playlists = deletions
+        if not del_tracks and not del_playlists:
+            return 0
+
+        self.root.after(
+            0, self._log_msg,
+            f"Removing {len(del_tracks)} un-ticked track(s) and "
+            f"{len(del_playlists)} playlist file(s) from the iPod...")
+        removed = []
+        for path in list(del_tracks) + list(del_playlists):
+            if self._cancel:
+                self.root.after(0, self._log_msg,
+                                "Removal cancelled by user.")
+                break
+            try:
+                os.remove(path)
+                removed.append(path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                self.root.after(0, self._log_msg,
+                                f"  Could not remove {os.path.basename(path)}"
+                                f": {e}")
+
+        music_root = self._ipod_music_root()
+        emptied = self._cleanup_empty_dirs(music_root)
+        if emptied:
+            self.root.after(0, self._log_msg,
+                            f"Removed {emptied} empty folder(s).")
+
+        track_paths = [p for p in removed if p in set(del_tracks)]
+        if track_paths:
+            updated = self._update_m3u_files(track_paths)
+            if updated:
+                self.root.after(0, self._log_msg,
+                                f"Updated {updated} playlist file(s).")
+        return len(removed)
+
     def _gather_library_tracks(self):
+        """Every ticked track in the library tree.
+
+        Only track rows are read. A ticked artist or album has already
+        cascaded its state down to its tracks, so walking containers as
+        well would return each track two or three times over, and would
+        be wrong for a container that is only partly ticked.
+        """
         tracks = []
         for iid, checked in self._tree_checked.items():
-            if not checked:
+            if not checked or iid in self._tree_partial:
                 continue
             info = self._tree_data.get(iid)
-            if not info:
-                continue
-            if info["type"] == "track":
+            if info and info["type"] == "track":
                 tracks.append(info["data"])
-            elif info["type"] == "album":
-                for child in self._tree.get_children(iid):
-                    child_info = self._tree_data.get(child)
-                    if child_info and child_info["type"] == "track":
-                        tracks.append(child_info["data"])
-            elif info["type"] == "artist":
-                for album_iid in self._tree.get_children(iid):
-                    for track_iid in self._tree.get_children(album_iid):
-                        child_info = self._tree_data.get(track_iid)
-                        if child_info and child_info["type"] == "track":
-                            tracks.append(child_info["data"])
         return tracks
 
     def _sync_finished(self):
