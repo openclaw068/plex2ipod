@@ -990,11 +990,14 @@ PRECHECK_TRACKS = {
 }
 
 
-@requires_tk
-class PrecheckTests(unittest.TestCase):
-    """On connect the tree should already show what is on the device:
-    fully-synced albums ticked, partly-synced ones half-ticked, and
-    artists that are not there left alone and never loaded."""
+class PrecheckFixture:
+    """A device holding Kid A, half of Amnesiac and a Workout.m3u,
+    connected to a library that also has Portishead."""
+
+    # The tracks Plex reports for the Workout playlist.
+    playlist_tracks = ()
+    # Whether the Library tab is open when the connection lands.
+    open_library = True
 
     def setUp(self):
         import shutil, tempfile
@@ -1020,7 +1023,8 @@ class PrecheckTests(unittest.TestCase):
                   "w") as fh:
             fh.write("#EXTM3U\n")
 
-        self.stub = StubPlex(playlists=PLAYLISTS, artists=PRECHECK_ARTISTS,
+        self.stub = StubPlex(tracks=self.playlist_tracks,
+                             playlists=PLAYLISTS, artists=PRECHECK_ARTISTS,
                              albums=PRECHECK_ALBUMS,
                              album_tracks=PRECHECK_TRACKS)
         self._real = self.p2i.app.PlexClient
@@ -1042,12 +1046,18 @@ class PrecheckTests(unittest.TestCase):
 
         def step():
             app.plex = self.stub
-            app._select_tab(1)
+            if self.open_library:
+                app._select_tab(1)
             app._on_connected(PLAYLISTS, "3")
             app.root.after(2500, app.root.quit)
 
         app.root.after(100, step)
         app.root.mainloop()
+
+    def pump(self, ms=2500):
+        """Run the mainloop long enough for worker callbacks to land."""
+        self.app.root.after(ms, self.app.root.quit)
+        self.app.root.mainloop()
 
     def row(self, label, parent=""):
         for iid in self.app._tree.get_children(parent):
@@ -1057,6 +1067,13 @@ class PrecheckTests(unittest.TestCase):
 
     def mark(self, iid):
         return self.app._tree.item(iid, "text")[0]
+
+
+@requires_tk
+class PrecheckTests(PrecheckFixture, unittest.TestCase):
+    """On connect the tree should already show what is on the device:
+    fully-synced albums ticked, partly-synced ones half-ticked, and
+    artists that are not there left alone and never loaded."""
 
     def test_a_fully_synced_album_is_ticked(self):
         album = self.row("Kid A", self.row("Radiohead"))
@@ -1135,3 +1152,105 @@ class PrecheckTests(unittest.TestCase):
         self.assertEqual(self.mark(self.row("Radiohead")), "☒")
         album = self.row("Kid A", self.row("Radiohead"))
         self.assertEqual(self.mark(album), "☑")
+
+
+WORKOUT_TRACKS = [PRECHECK_TRACKS["/a/kida"][0],     # 01 Everything
+                  PRECHECK_TRACKS["/a/amn"][0]]      # 01 Packt
+
+
+@requires_tk
+class PlaylistUntickTests(PrecheckFixture, unittest.TestCase):
+    """Un-ticking a playlist that is on the device removes its music, not
+    just its .m3u: its tracks are un-ticked in the library as well."""
+
+    playlist_tracks = WORKOUT_TRACKS
+
+    def untick_workout(self):
+        self.app._playlist_vars["1"][0].set(False)
+
+    def track(self, album, title):
+        return self.row(title, self.row(album, self.row("Radiohead")))
+
+    def queued(self):
+        tracks, playlists = self.app._pending_deletions()
+        return (sorted(os.path.basename(p) for p in tracks),
+                [os.path.basename(p) for p in playlists])
+
+    def test_the_playlist_tracks_are_unticked_in_the_library(self):
+        self.untick_workout()
+        self.assertEqual(self.mark(self.track("Kid A", "Everything")), "☐")
+        self.assertEqual(self.mark(self.track("Amnesiac", "Packt")), "☐")
+
+    def test_tracks_outside_the_playlist_stay_ticked(self):
+        self.untick_workout()
+        self.assertEqual(self.mark(self.track("Kid A", "Kid A")), "☑")
+        self.assertEqual(self.mark(self.row("Kid A", self.row("Radiohead"))),
+                         "☒")
+
+    def test_its_tracks_and_its_m3u_are_queued_for_deletion(self):
+        self.untick_workout()
+        self.assertEqual(self.queued(),
+                         (["01 Everything.flac", "01 Packt.flac"],
+                          ["Workout.m3u"]))
+
+    def test_retick_in_the_library_to_keep_a_track(self):
+        self.untick_workout()
+        self.app._set_checked(self.track("Kid A", "Everything"), True)
+        self.assertEqual(self.queued()[0], ["01 Packt.flac"])
+
+    def test_reticking_the_playlist_queues_nothing(self):
+        self.untick_workout()
+        self.app._playlist_vars["1"][0].set(True)
+        self.assertEqual(self.queued(), ([], []))
+
+    def test_rewriting_an_unticked_var_does_not_cascade(self):
+        # "Select none", or a theme rebuild, writes False to playlists that
+        # were never ticked; that must not touch the library.
+        self.untick_workout()
+        self.app._set_checked(self.track("Kid A", "Everything"), True)
+        self.app._pl_deselect_all()
+        self.assertEqual(self.mark(self.track("Kid A", "Everything")), "☑")
+
+    def test_sync_removes_the_files_from_the_device(self):
+        from unittest import mock
+        self.untick_workout()
+        music = os.path.join(self.ipod, "Music", "Radiohead")
+        with mock.patch.object(self.p2i.app.messagebox, "askyesno",
+                               return_value=True):
+            self.app._on_sync()
+            self.pump(4000)
+        self.assertFalse(self.app._syncing)
+        on_device = sorted(
+            os.path.relpath(os.path.join(d, f), music).replace(os.sep, "/")
+            for d, _dirs, files in os.walk(music) for f in files)
+        self.assertEqual(on_device, ["Kid A/02 Kid A.flac"])
+        self.assertFalse(os.path.exists(
+            os.path.join(self.ipod, "Playlists", "Workout.m3u")))
+
+
+@requires_tk
+class PlaylistOnlyUntickTests(PrecheckFixture, unittest.TestCase):
+    """The same, for someone who never opens the Library tab."""
+
+    playlist_tracks = WORKOUT_TRACKS
+    open_library = False
+
+    def test_its_tracks_are_queued_without_the_library_loaded(self):
+        self.app._playlist_vars["1"][0].set(False)
+        tracks, playlists = self.app._pending_deletions()
+        self.assertEqual(sorted(os.path.basename(p) for p in tracks),
+                         ["01 Everything.flac", "01 Packt.flac"])
+        self.assertEqual([os.path.basename(p) for p in playlists],
+                         ["Workout.m3u"])
+
+    def test_opening_the_library_later_does_not_retick_them(self):
+        self.app._playlist_vars["1"][0].set(False)
+        self.app._select_tab(1)
+        self.pump()
+        kid_a = self.row("Kid A", self.row("Radiohead"))
+        self.assertEqual(self.mark(self.row("Everything", kid_a)), "☐")
+        self.assertEqual(self.mark(self.row("Kid A", kid_a)), "☑")
+        self.assertEqual(
+            sorted(os.path.basename(p)
+                   for p in self.app._pending_deletions()[0]),
+            ["01 Everything.flac", "01 Packt.flac"])

@@ -19,6 +19,14 @@ from .version import APP_VERSION
 PLEX_TV = "https://plex.tv/api/v2"
 
 
+def _content_length(resp):
+    """The response's declared body size, or 0 when it gives none."""
+    try:
+        return max(int(resp.headers.get("Content-Length") or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _plex_headers(client_id, token=None):
     h = {
         "X-Plex-Product": "Plex2iPod",
@@ -104,10 +112,53 @@ def plex_pick_connection(server, timeout=5):
     return None, server["token"]
 
 
+def plex_find_server(client_id, token, previous_url=""):
+    """Ask plex.tv where the account's server can be reached now.
+
+    A server's LAN address changes whenever DHCP hands it a new one, and
+    the saved URL then leads nowhere. Returns a working (url, token), or
+    None when plex.tv cannot be reached, rejects the token, or no server
+    answers. The server behind previous_url is tried first: its
+    plex.direct hostname embeds an id that survives address changes.
+    """
+    try:
+        servers = plex_list_servers(client_id, token)
+    except (URLError, HTTPError, OSError, ValueError):
+        return None
+    host_id = _plex_direct_id(previous_url)
+    if host_id:
+        servers.sort(key=lambda s: 0 if any(
+            host_id in (c.get("uri") or "") for c in s["connections"]) else 1)
+    for server in servers:
+        url, server_token = plex_pick_connection(server)
+        if url:
+            return url, server_token
+    return None
+
+
+def _plex_direct_id(url):
+    """The server id in a https://1-2-3-4.<id>.plex.direct:32400 URL."""
+    host = url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+    labels = host.lower().split(".")
+    if len(labels) >= 4 and labels[-2:] == ["plex", "direct"]:
+        return labels[-3]
+    return ""
+
+
 class PlexClient:
     def __init__(self, base_url, token):
         self.base_url = base_url.rstrip("/")
         self.token = token
+
+    def ping(self, timeout=5):
+        """True if a Plex server answers at base_url. One quick try, so a
+        dead address is noticed in seconds rather than after _request's
+        retries."""
+        try:
+            with urlopen(f"{self.base_url}/identity", timeout=timeout) as resp:
+                return resp.status == 200
+        except (URLError, HTTPError, OSError, ValueError):
+            return False
 
     def _request(self, path):
         sep = "&" if "?" in path else "?"
@@ -131,12 +182,19 @@ class PlexClient:
                 time.sleep(0.5 * (2 ** attempt))
         raise last_err
 
-    def download_part(self, part_key, dest_path, cancel_check=None):
+    def download_part(self, part_key, dest_path, cancel_check=None,
+                      expected_size=0):
         """Stream a media Part from the Plex server to dest_path. Returns
         (True, None) on success or (False, error_msg) on failure. Writes
         to a .part sidecar and renames on completion so a partial download
         never masquerades as a finished file. cancel_check() -> bool lets
-        a long download abort cleanly."""
+        a long download abort cleanly.
+
+        A connection that drops mid-body ends the read loop exactly like a
+        finished one, so the byte count is checked against Content-Length,
+        or against expected_size (the size Plex reports for the part) when
+        the server sends none. A short file is retried, never kept: once a
+        truncated track is on the iPod, sync skips it forever."""
         if not part_key:
             return False, "no download key for this track"
         sep = "&" if "?" in part_key else "?"
@@ -145,7 +203,9 @@ class PlexClient:
         last_err = None
         for attempt in range(3):
             try:
+                written = 0
                 with urlopen(url, timeout=30) as resp, open(tmp, "wb") as out:
+                    expected = _content_length(resp) or expected_size
                     while True:
                         if cancel_check and cancel_check():
                             out.close()
@@ -155,6 +215,13 @@ class PlexClient:
                         if not chunk:
                             break
                         out.write(chunk)
+                        written += len(chunk)
+                if expected and written != expected:
+                    last_err = (f"incomplete download ({written} of "
+                                f"{expected} bytes)")
+                    self._safe_remove(tmp)
+                    time.sleep(0.5 * (2 ** attempt))
+                    continue
                 # Success — hand the finished temp file back to the caller,
                 # which decides whether to downsample or atomically place it.
                 return True, tmp
@@ -295,8 +362,8 @@ class PlexClient:
         # Original on-server filename, used to name the file on the iPod.
         # The server path may use either separator; take the basename of
         # both so a Linux server path ("/music/a/b.flac") still works.
-        server_path = part.get("file") or ""
-        filename = server_path.replace("\\", "/").rsplit("/", 1)[-1]
+        server_path = (part.get("file") or "").replace("\\", "/")
+        filename = server_path.rsplit("/", 1)[-1]
         try:
             size = int(part.get("size") or 0)
         except ValueError:
@@ -308,6 +375,9 @@ class PlexClient:
             "duration_ms": int(el.get("duration", 0)),
             "part_key": part_key,
             "filename": filename,
+            # Full path on the server. Music copied to the iPod by hand
+            # mirrors it, which is how such copies are recognised.
+            "server_path": server_path,
             "container": part.get("container", ""),
             "size": size,
         }

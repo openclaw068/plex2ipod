@@ -193,6 +193,9 @@ class StubPlex:
         self._album_tracks = album_tracks or {}
 
     # -- playlist / library API --
+    def ping(self, timeout=5):
+        return True
+
     def get_playlists(self):
         return list(self._playlists)
 
@@ -212,7 +215,8 @@ class StubPlex:
         return list(self.tracks)
 
     # -- media transfer --
-    def download_part(self, part_key, dest_path, cancel_check=None):
+    def download_part(self, part_key, dest_path, cancel_check=None,
+                      expected_size=0):
         if cancel_check is not None and cancel_check():
             return False, "cancelled"
         if part_key in self.fail_keys:
@@ -370,7 +374,12 @@ class IPodTestCase(unittest.TestCase):
         app._playlist_vars = {}
         app._playlist_track_cache = {}
         app._playlist_fetching = set()
+        app._playlist_ticked = set()
+        app._playlist_pending_untick = set()
+        app._playlist_removed_paths = set()
         app._ipod_index = None
+        app._ipod_sizes = {}
+        app._ipod_by_name_size = {}
         app._indexed_root = None
         app._capacity = None
         app._capacity_after = None
@@ -386,22 +395,34 @@ class IPodTestCase(unittest.TestCase):
 
 class TempAppDir:
     """Redirect the app's config directory so tests never touch the real
-    config.json in the project root.
+    config.json in the project root, and hide any real iPod.
 
     ConfigManager imported app_dir into plex2ipod.config, so that is the
     binding to replace — patching plex2ipod.app_dir would have no effect.
+
+    Device detection is blanked for the same reason. An App auto-selects
+    whatever iPod is plugged in, so without this a GUI test run with a
+    real device mounted reads it, and anything that writes would write
+    to it.
     """
 
     def __init__(self, module):
         self.config_module = module.config
+        self.app_module = module.app
         self.dir = tempfile.mkdtemp(prefix="plex2ipod-cfg-")
         self._original = self.config_module.app_dir
+        self._detect = (self.app_module.detect_ipod_roots,
+                        self.app_module.list_ipod_roots)
 
     def __enter__(self):
         self.config_module.app_dir = lambda: self.dir
+        self.app_module.detect_ipod_roots = lambda: []
+        self.app_module.list_ipod_roots = lambda: []
         return self.dir
 
     def __exit__(self, *exc):
         self.config_module.app_dir = self._original
+        (self.app_module.detect_ipod_roots,
+         self.app_module.list_ipod_roots) = self._detect
         shutil.rmtree(self.dir, ignore_errors=True)
         return False

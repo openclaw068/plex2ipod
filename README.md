@@ -16,8 +16,16 @@ tree plus `.m3u` playlists that Rockbox can read.
   ☑, partly-synced ones ☒, so you adjust from your current state instead of
   re-selecting everything. Un-ticking something that is on the device queues it
   for removal; Sync confirms additions and deletions together before touching
-  anything
-- Downloads only what's missing; a song in two playlists is fetched once
+  anything. Un-ticking a playlist removes its songs too, except ones another
+  ticked playlist uses; re-tick any in the Library tab to keep them
+- **Built for a slow USB link.** Downloads only what's missing, and a song in
+  two playlists is fetched once. A track already on the iPod under another
+  folder (copied by hand, or moved by a Plex rename) is renamed into place
+  instead of downloaded again. Downloads and 24-bit conversion happen on the
+  computer, so each track crosses USB exactly once, at its final size.
+  Removals run first, so their space is free for the new tracks
+- Every download is checked against the size the server sent; a connection
+  that drops mid-song is retried, never left on the iPod as a cut-off file
 - **Capacity bar** showing how full the iPod is and what the current selection
   would add. Tracks already on the device cost nothing. If the selection won't
   fit, the bar turns red and Sync offers to fill the device and stop, or to
@@ -26,10 +34,14 @@ tree plus `.m3u` playlists that Rockbox can read.
   dither, for iPod hardware that can't play hi-res files
 - **Manage iPod** tab: browse what's on the device, delete tracks, albums,
   artists or playlists, and strip the deleted entries out of your `.m3u` files
-- **Verify & Repair**: probes every FLAC on the iPod and re-downloads broken
-  ones from Plex
+- **Verify & Repair**: checks every FLAC on the iPod, including decoding the
+  last seconds to catch files cut short, and re-downloads broken ones from Plex
+- **Organize**: finds music copied onto the iPod by hand that matches your
+  Plex library and moves it into the Artist/Album layout (renames only), so
+  it shows up ticked and is never downloaded again
 - **Rebuild Rockbox DB**: clears `.rockbox/database_*.tcd` so Rockbox rescans
 - Auto-detects the iPod on Windows (drive letters) and Linux (`/media`, `/mnt`)
+- If the Plex server's address changes, Connect finds it again through plex.tv
 - Safe eject from inside the app
 - Dark and light themes
 

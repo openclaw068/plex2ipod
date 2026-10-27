@@ -215,3 +215,45 @@ class CapacityConfirmTests(IPodTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CapacityCreditTests(IPodTestCase):
+    """What a sync would move rather than download costs nothing, and what
+    its deletions free counts toward the space the selection may use."""
+
+    def make_app(self, tracks, sizes):
+        app = self.bare_app()
+        app._playlist_vars = {}
+        app._gather_library_tracks = lambda: list(tracks)
+        app._ipod_index = {rel: os.path.join(self.ipod.music_dir, rel)
+                           for rel in sizes}
+        app._set_ipod_sizes(dict(sizes))
+        return app
+
+    def test_a_hand_copied_track_costs_nothing(self):
+        track = make_track(1, filename="01 - Song.flac", size=9000,
+                           server_path="D:/Music/Release-xpost/01 - Song.flac")
+        app = self.make_app([track], {"release-xpost/01 - song.flac": 8000})
+        self.assertEqual(app._selection_bytes()[0], 0)
+
+    def test_a_renamed_track_costs_nothing(self):
+        track = make_track(1, album="New", filename="a.flac", size=9000)
+        app = self.make_app([track], {"artist/old/a.flac": 9000})
+        self.assertEqual(app._selection_bytes()[0], 0)
+
+    def test_a_file_another_selected_track_owns_is_not_counted_twice(self):
+        owner = make_track(1, album="One", filename="a.flac", size=9000)
+        other = make_track(2, album="Two", filename="a.flac", size=9000)
+        app = self.make_app([owner, other], {"artist/one/a.flac": 9000})
+        self.assertEqual(app._selection_bytes()[0], 9000)
+
+    def test_pending_deletions_are_credited(self):
+        gone = self.ipod.add_track("Artist", "Album", "gone.flac", size=6000)
+        app = self.make_app([], {"artist/album/gone.flac": 6000})
+        app._baseline_paths = {"artist/album/gone.flac"}
+        self.assertEqual(app._freed_bytes(), 6000)
+        self.assertTrue(os.path.exists(gone))
+
+    def test_nothing_is_credited_without_deletions(self):
+        app = self.make_app([], {"artist/album/kept.flac": 6000})
+        self.assertEqual(app._freed_bytes(), 0)

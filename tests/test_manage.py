@@ -4,6 +4,7 @@ and empty-folder tidying.
 
 import os
 import unittest
+from unittest import mock
 
 from helpers import (IPodTestCase, make_track, requires_ffmpeg,
                      requires_ffprobe)
@@ -406,6 +407,83 @@ class FlacIntegrityTests(IPodTestCase):
         app = self.bare_app(audio=self.p2i.AudioConverter())
         self.assertFalse(app._is_flac_broken(path))
 
+    def make_flac(self, name, seconds=30, extra=()):
+        import subprocess
+        path = os.path.join(self.ipod.music_dir, name)
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+             "-i", "sine=frequency=440:duration=%d" % seconds]
+            + list(extra) + [path],
+            check=True, capture_output=True, timeout=60)
+        return path
+
+    @requires_ffmpeg
+    def test_a_file_cut_short_mid_download_is_broken(self):
+        # The header still claims the full length, so ffprobe alone
+        # passes this file; only decoding its tail shows the audio is gone.
+        path = self.make_flac("cut.flac")
+        with open(path, "rb") as fh:
+            data = fh.read()
+        with open(path, "wb") as fh:
+            fh.write(data[:len(data) // 3])
+        app = self.bare_app(audio=self.p2i.AudioConverter())
+        self.assertTrue(app._is_flac_broken(path))
+
+    @requires_ffmpeg
+    def test_an_appended_id3v1_tag_is_not_damage(self):
+        # Found on a real iPod: taggers append a 128-byte "TAG" block after
+        # the FLAC data. ffmpeg complains about it, but the audio is whole.
+        path = self.make_flac("tagged.flac")
+        with open(path, "ab") as fh:
+            fh.write(b"TAG" + b"\0" * 125)
+        app = self.bare_app(audio=self.p2i.AudioConverter())
+        self.assertFalse(app._is_flac_broken(path))
+
+    @requires_ffmpeg
+    def test_a_file_missing_its_last_seconds_is_broken(self):
+        # Also from the real iPod: a copy cut off ~3 s before the end.
+        path = self.make_flac("ending.flac")
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            data = fh.read()
+        with open(path, "wb") as fh:
+            fh.write(data[:size - size // 10])
+        app = self.bare_app(audio=self.p2i.AudioConverter())
+        self.assertTrue(app._is_flac_broken(path))
+
+    @requires_ffmpeg
+    def test_a_file_much_shorter_than_plex_says_is_broken(self):
+        path = self.make_flac("short.flac", seconds=10)
+        app = self.bare_app(audio=self.p2i.AudioConverter())
+        self.assertTrue(app._is_flac_broken(path, expected_ms=30000))
+
+    @requires_ffmpeg
+    def test_a_length_matching_plex_is_fine(self):
+        path = self.make_flac("ok.flac", seconds=10)
+        app = self.bare_app(audio=self.p2i.AudioConverter())
+        self.assertFalse(app._is_flac_broken(path, expected_ms=10400))
+
+    @requires_ffmpeg
+    def test_a_healthy_hi_res_file_is_not_broken(self):
+        path = self.make_flac("hires.flac", extra=[
+            "-ar", "96000", "-sample_fmt", "s32",
+            "-bits_per_raw_sample", "24"])
+        app = self.bare_app(audio=self.p2i.AudioConverter())
+        self.assertFalse(app._is_flac_broken(path))
+
+    @requires_ffmpeg
+    def test_embedded_cover_art_is_not_mistaken_for_damage(self):
+        import subprocess
+        art = os.path.join(self.ipod.music_dir, "cover.png")
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                        "color=c=red:s=300x300", "-frames:v", "1", art],
+                       check=True, capture_output=True, timeout=60)
+        path = self.make_flac("art.flac", extra=[
+            "-i", art, "-map", "0:a", "-map", "1:v", "-c:v", "png",
+            "-disposition:v", "attached_pic"])
+        app = self.bare_app(audio=self.p2i.AudioConverter())
+        self.assertFalse(app._is_flac_broken(path))
+
     @requires_ffmpeg
     def test_probe_reports_bit_depth_and_sample_rate(self):
         import subprocess
@@ -423,3 +501,110 @@ class FlacIntegrityTests(IPodTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OrganizeTests(IPodTestCase):
+    """Organize moves hand-copied music into Artist/Album/track so the app
+    recognises it. Renames only: nothing downloaded, nothing deleted."""
+
+    RELEASE = "Pink.Floyd.-.The.Wall.(2007.Remaster).[FLAC].88-xpost"
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(self.p2i.app.messagebox, "showinfo")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def put(self, *parts, size=4096):
+        path = os.path.join(self.ipod.music_dir, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(b"\1" * size)
+        return path
+
+    def track(self, n, *server_folders, album="The Wall", size=4096):
+        name = "%02d.Pink.Floyd.-.Song.flac" % n
+        return make_track(n, artist="Pink Floyd", album=album, filename=name,
+                          size=size, server_path="D:/Music/" + "/".join(
+                              server_folders + (name,)))
+
+    def run_organize(self, tracks, answer=True):
+        app = self.bare_app()
+        app.plex = object()
+        app._section_id = "3"
+        library = {self.p2i.ipod_rel_path(t).lower(): t for t in tracks}
+        app._build_plex_index = lambda: (library, None)
+        app._ask_yes_no = mock.Mock(return_value=answer)
+        app._organize_finished = lambda moved: setattr(app, "moved", moved)
+        app._organize_worker(self.ipod.path, self.ipod.music_dir)
+        return app
+
+    def dest(self, track):
+        return os.path.join(self.ipod.music_dir,
+                            *self.p2i.ipod_rel_path(track).split("/"))
+
+    def test_hand_copied_tracks_are_moved_into_place(self):
+        tracks = [self.track(n, self.RELEASE) for n in (1, 2)]
+        for t in tracks:
+            self.put(self.RELEASE, t["filename"])
+        app = self.run_organize(tracks)
+        self.assertEqual(app.moved, 2)
+        for t in tracks:
+            self.assertTrue(os.path.exists(self.dest(t)))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.ipod.music_dir, self.RELEASE)))
+
+    def test_playlists_follow_the_moved_files(self):
+        t = self.track(1, self.RELEASE)
+        self.put(self.RELEASE, t["filename"])
+        self.ipod.write_m3u("Old", ["/Music/%s/%s" % (self.RELEASE,
+                                                      t["filename"])])
+        self.run_organize([t])
+        self.assertEqual(self.ipod.m3u_entries("Old"),
+                         ["/Music/" + self.p2i.ipod_rel_path(t)])
+
+    def test_tracks_already_in_place_are_untouched(self):
+        t = make_track(1, artist="A", album="B", filename="x.flac")
+        path = self.ipod.add_track("A", "B", "x.flac")
+        app = self.run_organize([t])
+        self.assertTrue(os.path.exists(path))
+        app._ask_yes_no.assert_not_called()
+
+    def test_music_plex_does_not_know_stays_put(self):
+        stranger = self.put("Bootlegs", "live.flac")
+        t = self.track(1, self.RELEASE)
+        self.put(self.RELEASE, t["filename"])
+        self.run_organize([t])
+        self.assertTrue(os.path.exists(stranger))
+
+    def test_declining_moves_nothing(self):
+        t = self.track(1, self.RELEASE)
+        src = self.put(self.RELEASE, t["filename"])
+        app = self.run_organize([t], answer=False)
+        self.assertTrue(os.path.exists(src))
+        self.assertEqual(app.moved, 0)
+
+    def test_a_file_in_place_for_one_track_is_never_taken_by_another(self):
+        owner = make_track(1, artist="A", album="One", filename="x.flac")
+        twin = make_track(2, artist="B", album="Two", filename="x.flac")
+        path = self.ipod.add_track("A", "One", "x.flac")
+        self.run_organize([owner, twin])
+        self.assertTrue(os.path.exists(path))
+        self.assertFalse(os.path.exists(self.dest(twin)))
+
+    def test_non_music_leftovers_are_kept(self):
+        t = self.track(1, self.RELEASE)
+        self.put(self.RELEASE, t["filename"])
+        nfo = self.put(self.RELEASE, "release.nfo")
+        self.run_organize([t])
+        self.assertTrue(os.path.exists(nfo))
+
+    def test_the_log_reports_the_plan(self):
+        t = self.track(1, self.RELEASE)
+        self.put(self.RELEASE, t["filename"])
+        self.put("Bootlegs", "live.flac")
+        app = self.run_organize([t])
+        log = "\n".join(app.logs)
+        self.assertIn("0 track(s) already in place, 1 to move, "
+                      "1 not found in Plex", log)
+        self.assertIn("Organize complete: 1 track(s) moved", log)
