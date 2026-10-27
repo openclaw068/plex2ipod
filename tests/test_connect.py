@@ -145,3 +145,68 @@ class ConnectWorkerTests(IPodTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PickConnectionTests(unittest.TestCase):
+    """Addresses are tried at once, so dead ones cost one timeout in total,
+    not one each; the preferred live address still wins."""
+
+    def setUp(self):
+        import socket, threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        self.plexapi = app_module().plexapi
+
+        class Identity(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"<MediaContainer/>")
+
+            def log_message(self, *args):
+                pass
+
+        self.live = []
+        for _ in range(2):
+            server = HTTPServer(("127.0.0.1", 0), Identity)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            self.live.append("http://127.0.0.1:%d" % server.server_port)
+
+        # Accepts connections (via the backlog) but never answers: what an
+        # address inside someone else's Docker network looks like.
+        self.dead = []
+        for _ in range(3):
+            sock = socket.socket()
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(8)
+            self.addCleanup(sock.close)
+            self.dead.append("http://127.0.0.1:%d" % sock.getsockname()[1])
+
+    def pick(self, connections, timeout=1):
+        import time
+        server = {"token": "t", "connections": connections}
+        start = time.monotonic()
+        result = self.plexapi.plex_pick_connection(server, timeout=timeout)
+        return result[0], time.monotonic() - start
+
+    def test_dead_addresses_cost_one_timeout_not_one_each(self):
+        connections = ([{"uri": u, "local": True} for u in self.dead]
+                       + [{"uri": self.live[0], "local": False}])
+        url, took = self.pick(connections)
+        self.assertEqual(url, self.live[0])
+        self.assertLess(took, 2.5, "three dead addresses tried in turn "
+                                   "would take three seconds or more")
+
+    def test_a_local_address_is_preferred_when_both_answer(self):
+        url, _ = self.pick([{"uri": self.live[1], "relay": True},
+                            {"uri": self.live[0], "local": True}])
+        self.assertEqual(url, self.live[0])
+
+    def test_nothing_answering_is_none(self):
+        url, took = self.pick([{"uri": u, "local": True} for u in self.dead])
+        self.assertIsNone(url)
+        self.assertLess(took, 2.5)
+
+    def test_no_connections_is_none(self):
+        self.assertEqual(self.pick([])[0], None)

@@ -1490,15 +1490,18 @@ class App:
         tk.Label(win, text="Sign in to your Plex account",
                  bg=self.t["bg_card"], fg=self.t["fg_heading"],
                  font=("Segoe UI", 13, "bold")).pack(padx=28, pady=(20, 4))
-        tk.Label(win,
-                 text="A browser is opening to plex.tv/link.\n"
-                      "Enter this code there:",
+        self._signin_hint_var = tk.StringVar(
+            value="A browser is opening to plex.tv/link.\n"
+                  "Enter this code there:")
+        tk.Label(win, textvariable=self._signin_hint_var,
                  bg=self.t["bg_card"], fg=self.t["fg_dim"],
                  font=("Segoe UI", 10), justify="center").pack(padx=28)
         self._signin_code_var = tk.StringVar(value="·····")
-        tk.Label(win, textvariable=self._signin_code_var,
-                 bg=self.t["bg_card"], fg=self.t["accent"],
-                 font=("Consolas", 30, "bold")).pack(padx=28, pady=10)
+        self._signin_code_label = tk.Label(
+            win, textvariable=self._signin_code_var,
+            bg=self.t["bg_card"], fg=self.t["accent"],
+            font=("Consolas", 30, "bold"))
+        self._signin_code_label.pack(padx=28, pady=10)
         self._signin_msg_var = tk.StringVar(value="Requesting a code from Plex…")
         tk.Label(win, textvariable=self._signin_msg_var,
                  bg=self.t["bg_card"], fg=self.t["fg_dim"],
@@ -1550,6 +1553,19 @@ class App:
         except (tk.TclError, AttributeError):
             pass
 
+    def _signin_authorized(self):
+        """Plex accepted the code. Say so plainly: left showing the code
+        and "Enter this code there", the dialog looks stuck while the
+        server is being found."""
+        try:
+            self._signin_hint_var.set("Plex accepted the code.")
+            self._signin_code_var.set("\u2713")
+            self._signin_code_label.configure(fg=self.t["success"])
+            self._signin_msg_var.set(
+                "Signed in. Finding your Plex server\u2026")
+        except (tk.TclError, AttributeError):
+            pass
+
     def _signin_set_msg(self, msg):
         try:
             self._signin_msg_var.set(msg)
@@ -1588,8 +1604,7 @@ class App:
                             "Click Sign in to Plex to try again.")
             return
 
-        self.root.after(0, self._signin_set_msg,
-                        "Signed in! Finding your Plex server…")
+        self.root.after(0, self._signin_authorized)
         url, chosen_token, n = "", token, 0
         try:
             servers = plex_list_servers(cid, token)

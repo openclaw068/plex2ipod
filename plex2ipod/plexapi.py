@@ -8,6 +8,7 @@ plex.tv which servers the account owns and auto-fill the server URL.
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen, Request
@@ -85,7 +86,12 @@ def plex_list_servers(client_id, token):
 
 def plex_pick_connection(server, timeout=5):
     """Find a working base URL for a server by trying its connections,
-    preferring a local (LAN) address over remote, and remote over relay."""
+    preferring a local (LAN) address over remote, and remote over relay.
+
+    All of them are tried at once. A server can advertise addresses no one
+    else can reach (one inside its Docker network, say); each such address
+    costs its full timeout, and tried one after another those add up to
+    most of a minute of an apparently frozen sign-in."""
     def rank(c):
         return (0 if c.get("local") else 1, 1 if c.get("relay") else 0)
     candidates = []
@@ -95,21 +101,35 @@ def plex_pick_connection(server, timeout=5):
         addr, port, proto = c.get("address"), c.get("port"), c.get("protocol")
         if addr and port:
             candidates.append(f"{proto or 'http'}://{addr}:{port}")
-    seen = set()
-    for uri in candidates:
-        if uri in seen:
-            continue
-        seen.add(uri)
+    unique = list(dict.fromkeys(uri.rstrip("/") for uri in candidates))
+    if not unique:
+        return None, server["token"]
+
+    def answers(uri):
         try:
-            req = Request(uri.rstrip("/") + "/identity",
+            req = Request(uri + "/identity",
                           headers={"X-Plex-Token": server["token"],
                                    "Accept": "application/json"})
             with urlopen(req, timeout=timeout) as resp:
-                if resp.status == 200:
-                    return uri.rstrip("/"), server["token"]
-        except (URLError, HTTPError, OSError):
-            continue
-    return None, server["token"]
+                return resp.status == 200
+        except (URLError, HTTPError, OSError, ValueError):
+            return False
+
+    pool = ThreadPoolExecutor(max_workers=len(unique))
+    try:
+        futures = [pool.submit(answers, uri) for uri in unique]
+        # Walk in preference order: the best address that answers wins,
+        # once every better one has failed or run out of time.
+        deadline = time.monotonic() + timeout + 1
+        for uri, future in zip(unique, futures):
+            try:
+                if future.result(max(deadline - time.monotonic(), 0)):
+                    return uri, server["token"]
+            except Exception:
+                continue
+        return None, server["token"]
+    finally:
+        pool.shutdown(wait=False)
 
 
 def plex_find_server(client_id, token, previous_url=""):
