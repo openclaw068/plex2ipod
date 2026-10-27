@@ -7,6 +7,7 @@ this package directory.
 
 import os
 import sys
+import tempfile
 
 # The directory holding Plex2iPod.pyw, i.e. one level above this package.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -18,6 +19,24 @@ def app_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return PROJECT_ROOT
+
+
+def staging_root():
+    """Scratch folder for downloads and conversions, on disk.
+
+    Not the system temp folder: on many Linux systems, Fedora included,
+    /tmp lives in RAM, and a hi-res FLAC parked there competes with every
+    other program for memory. Files here last only until they are on the
+    iPod.
+    """
+    if sys.platform.startswith("win"):
+        base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Caches")
+    else:
+        base = (os.environ.get("XDG_CACHE_HOME")
+                or os.path.expanduser("~/.cache"))
+    return os.path.join(base, "plex2ipod")
 
 
 def resource_dirs():

@@ -8,7 +8,9 @@ turn makes Verify & Repair consider the entire library broken.
 """
 
 import os
+import shutil
 import stat
+import subprocess
 import tempfile
 import unittest
 
@@ -165,3 +167,81 @@ class AvailabilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IpodTargetTests(unittest.TestCase):
+    """What gets converted, and to what. The iPod plays at most 48 kHz."""
+
+    def setUp(self):
+        self.audio = app_module().audio
+
+    def test_sample_rates_drop_within_their_family(self):
+        rate = self.audio.ipod_sample_rate
+        self.assertIsNone(rate(44100))
+        self.assertIsNone(rate(48000))
+        self.assertEqual(rate(88200), 44100)
+        self.assertEqual(rate(176400), 44100)
+        self.assertEqual(rate(352800), 44100)
+        self.assertEqual(rate(96000), 48000)
+        self.assertEqual(rate(192000), 48000)
+        self.assertIsNone(rate(None))
+
+    def test_what_needs_converting(self):
+        needs = self.audio.needs_conversion
+        self.assertFalse(needs({"bit_depth": 16, "sample_rate": 44100}))
+        self.assertFalse(needs({"bit_depth": 16, "sample_rate": 48000}))
+        self.assertTrue(needs({"bit_depth": 24, "sample_rate": 44100}))
+        self.assertTrue(needs({"bit_depth": 16, "sample_rate": 96000}))
+        self.assertFalse(needs(None))
+
+    def test_labels(self):
+        info = {"bit_depth": 24, "sample_rate": 96000}
+        self.assertEqual(self.audio.describe(info), "24-bit/96 kHz")
+        self.assertEqual(self.audio.describe(self.audio.converted_info(info)),
+                         "16-bit/48 kHz")
+        self.assertEqual(self.audio.describe(self.audio.converted_info(
+            {"bit_depth": 24, "sample_rate": 44100})), "16-bit/44.1 kHz")
+
+
+@unittest.skipUnless(shutil.which("ffmpeg"), "needs ffmpeg")
+class RealResampleTests(unittest.TestCase):
+    def setUp(self):
+        self.p2i = app_module()
+        self.dir = tempfile.mkdtemp(prefix="plex2ipod-rs-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def make(self, rate, fmt="s32", bits="24"):
+        path = os.path.join(self.dir, "src-%d.flac" % rate)
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                        "sine=frequency=1000:duration=5", "-ar", str(rate),
+                        "-sample_fmt", fmt, "-bits_per_raw_sample", bits,
+                        path], check=True)
+        return path
+
+    def convert(self, src, rate):
+        audio = self.p2i.AudioConverter()
+        dst = os.path.join(self.dir, "out.flac")
+        ok, err = audio.downsample(src, dst, sample_rate=rate)
+        self.assertTrue(ok, err)
+        return audio, dst
+
+    def test_24_bit_96k_becomes_16_bit_48k_and_much_smaller(self):
+        src = self.make(96000)
+        audio, dst = self.convert(src, 48000)
+        self.assertEqual(audio.probe(dst),
+                         {"bit_depth": 16, "sample_rate": 48000})
+        self.assertLess(os.path.getsize(dst), os.path.getsize(src) / 2)
+
+    def test_the_length_is_kept(self):
+        src = self.make(88200)
+        _audio, dst = self.convert(src, 44100)
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                              "format=duration", "-of", "csv=p=0", dst],
+                             capture_output=True, text=True).stdout
+        self.assertAlmostEqual(float(out), 5.0, delta=0.05)
+
+    def test_without_a_rate_the_rate_is_kept(self):
+        src = self.make(44100)
+        audio, dst = self.convert(src, None)
+        self.assertEqual(audio.probe(dst),
+                         {"bit_depth": 16, "sample_rate": 44100})

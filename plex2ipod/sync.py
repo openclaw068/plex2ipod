@@ -71,6 +71,48 @@ class SyncEngine:
                 f.write(f"#EXTINF:{dur},{label}\n{self.m3u_path(t)}\n")
 
 
+# Anything Rockbox might play. A folder holding one of these is never
+# treated as clutter, whatever else is in it.
+AUDIO_EXTENSIONS = (".flac", ".mp3", ".m4a", ".m4b", ".aac", ".alac",
+                    ".ogg", ".oga", ".opus", ".wav", ".aif", ".aiff", ".ape",
+                    ".wv", ".mpc", ".wma", ".mka", ".dsf", ".dff")
+
+
+def find_clutter(music_root):
+    """Folders under music_root with no music in them at any depth.
+
+    Returns [(path, file count, bytes), ...] for the topmost such folders
+    only, so a release folder full of leftovers is one entry rather than
+    one per subfolder. A folder that could not be read counts as holding
+    music: what was not seen is never offered for deletion.
+    """
+    has_music = {}
+    totals = {}
+    for dirpath, dirnames, filenames in os.walk(music_root, topdown=False):
+        music = any(n.lower().endswith(AUDIO_EXTENSIONS) for n in filenames)
+        count, size = len(filenames), 0
+        for name in filenames:
+            try:
+                size += os.path.getsize(os.path.join(dirpath, name))
+            except OSError:
+                pass
+        for name in dirnames:
+            child = os.path.join(dirpath, name)
+            music = music or has_music.get(child, True)
+            sub_count, sub_size = totals.get(child, (0, 0))
+            count, size = count + sub_count, size + sub_size
+        has_music[dirpath] = music
+        totals[dirpath] = (count, size)
+    clutter = []
+    for path, music in has_music.items():
+        if music or path == music_root:
+            continue
+        parent = os.path.dirname(path)
+        if parent == music_root or has_music.get(parent, True):
+            clutter.append((path,) + totals[path])
+    return sorted(clutter)
+
+
 # Sidecars left by an interrupted download, copy or conversion. Never music.
 LEFTOVER_SUFFIXES = (".part", ".flac.tmp")
 

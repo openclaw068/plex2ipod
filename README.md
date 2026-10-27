@@ -30,8 +30,15 @@ tree plus `.m3u` playlists that Rockbox can read.
   would add. Tracks already on the device cost nothing. If the selection won't
   fit, the bar turns red and Sync offers to fill the device and stop, or to
   cancel so you can trim the selection
-- Optional **24-bit → 16-bit FLAC downsampling** with triangular high-pass
-  dither, for iPod hardware that can't play hi-res files
+- Optional **hi-res shrinking**: FLACs above 16-bit become 16-bit with
+  triangular high-pass dither, and above 48 kHz are resampled to 48 or
+  44.1 kHz, the most the iPod's hardware plays. A 24-bit/96 kHz album ends
+  up a quarter to a half the size, so it also transfers that much faster.
+  **Shrink Hi-Res** on the Manage tab does the same for music already on
+  the iPod, fetching fresh from Plex where it can
+- Downloads and conversions are staged in the user cache folder (on disk,
+  not RAM-backed `/tmp`), and each song's local copy is deleted as soon as
+  it is on the iPod
 - **Manage iPod** tab: browse what's on the device, delete tracks, albums,
   artists or playlists, and strip the deleted entries out of your `.m3u` files
 - **Verify & Repair**: checks every FLAC on the iPod, including decoding the
@@ -39,6 +46,9 @@ tree plus `.m3u` playlists that Rockbox can read.
 - **Organize**: finds music copied onto the iPod by hand that matches your
   Plex library and moves it into the Artist/Album layout (renames only), so
   it shows up ticked and is never downloaded again
+- **Clean Up**: deletes folders under `Music/` that hold no music at any
+  depth (leftover `.nfo`, `.sfv`, logs, artwork, download-tool folders),
+  after listing them and asking
 - **Rebuild Rockbox DB**: clears `.rockbox/database_*.tcd` so Rockbox rescans
 - Auto-detects the iPod on Windows (drive letters) and Linux (`/media`, `/mnt`)
 - If the Plex server's address changes, Connect finds it again through plex.tv

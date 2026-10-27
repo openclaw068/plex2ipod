@@ -241,7 +241,7 @@ class NoAudio:
     def probe(self, path):
         return None
 
-    def downsample(self, src, dst, timeout=300):
+    def downsample(self, src, dst, timeout=300, sample_rate=None):
         return False, "ffmpeg not available"
 
 
@@ -253,7 +253,7 @@ class FailingAudio(NoAudio):
     def probe(self, path):
         return {"bit_depth": 24, "sample_rate": 96000}
 
-    def downsample(self, src, dst, timeout=300):
+    def downsample(self, src, dst, timeout=300, sample_rate=None):
         return False, "simulated ffmpeg failure"
 
 
@@ -347,6 +347,13 @@ class IPodTestCase(unittest.TestCase):
         self.p2i = app_module()
         self.ipod = FakeIPod(music_folder=self.music_folder)
         self.addCleanup(self.ipod.cleanup)
+        # Downloads stage in the user's cache folder; keep tests out of it.
+        self.staging_root = tempfile.mkdtemp(prefix="plex2ipod-stage-")
+        self.addCleanup(shutil.rmtree, self.staging_root, True)
+        module = self.p2i.app
+        original = module.staging_root
+        module.staging_root = lambda: self.staging_root
+        self.addCleanup(setattr, module, "staging_root", original)
 
     def bare_app(self, **attrs):
         """An App with __init__ skipped and the common collaborators stubbed.
@@ -412,17 +419,20 @@ class TempAppDir:
         self.dir = tempfile.mkdtemp(prefix="plex2ipod-cfg-")
         self._original = self.config_module.app_dir
         self._detect = (self.app_module.detect_ipod_roots,
-                        self.app_module.list_ipod_roots)
+                        self.app_module.list_ipod_roots,
+                        self.app_module.staging_root)
 
     def __enter__(self):
         self.config_module.app_dir = lambda: self.dir
         self.app_module.detect_ipod_roots = lambda: []
         self.app_module.list_ipod_roots = lambda: []
+        self.app_module.staging_root = lambda: os.path.join(self.dir, "stage")
         return self.dir
 
     def __exit__(self, *exc):
         self.config_module.app_dir = self._original
         (self.app_module.detect_ipod_roots,
-         self.app_module.list_ipod_roots) = self._detect
+         self.app_module.list_ipod_roots,
+         self.app_module.staging_root) = self._detect
         shutil.rmtree(self.dir, ignore_errors=True)
         return False

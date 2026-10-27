@@ -608,3 +608,177 @@ class OrganizeTests(IPodTestCase):
         self.assertIn("0 track(s) already in place, 1 to move, "
                       "1 not found in Plex", log)
         self.assertIn("Organize complete: 1 track(s) moved", log)
+
+
+def _real_flac(path, rate=96000, fmt="s32", bits="24", seconds=4):
+    import subprocess
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    "sine=frequency=440:duration=%d" % seconds,
+                    "-ar", str(rate), "-sample_fmt", fmt,
+                    "-bits_per_raw_sample", bits, path],
+                   check=True, capture_output=True, timeout=60)
+    return path
+
+
+class ShrinkHiResTests(IPodTestCase):
+    """Shrink Hi-Res replaces every FLAC above 16-bit or 48 kHz with an
+    iPod-sized copy, from Plex when it has the track, else from the copy
+    on the iPod. Plex is optional."""
+
+    def setUp(self):
+        super().setUp()
+        for name in ("showinfo", "showwarning"):
+            patcher = mock.patch.object(self.p2i.app.messagebox, name)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_shrink(self, plex_index=None, answer=True):
+        app = self.bare_app(audio=self.p2i.AudioConverter())
+        app._manage_status_var = mock.Mock()
+        app._ask_yes_no = mock.Mock(return_value=answer)
+        if plex_index is not None:
+            app.plex = object()
+            app._section_id = "3"
+            app._build_plex_index = lambda: (plex_index, None)
+        app._redownload_track = mock.Mock(return_value=(True, None))
+        app._downsample_existing_worker(self.ipod.music_dir)
+        return app
+
+    def path(self, *parts):
+        return os.path.join(self.ipod.music_dir, *parts)
+
+    @requires_ffmpeg
+    def test_without_plex_the_copy_on_the_ipod_is_converted(self):
+        song = _real_flac(self.path("Release-xpost", "01.flac"))
+        before = os.path.getsize(song)
+        app = self.run_shrink()
+        self.assertEqual(app.audio.probe(song),
+                         {"bit_depth": 16, "sample_rate": 48000})
+        self.assertLess(os.path.getsize(song), before / 2)
+        self.assertIn("Shrink complete: 1/1 replaced", "\n".join(app.logs))
+
+    @requires_ffmpeg
+    def test_a_16_bit_96k_file_is_shrunk(self):
+        song = _real_flac(self.path("A", "B", "01.flac"), fmt="s16",
+                          bits="16")
+        app = self.run_shrink()
+        self.assertEqual(app.audio.probe(song)["sample_rate"], 48000)
+
+    @requires_ffmpeg
+    def test_a_track_plex_has_is_fetched_fresh_instead(self):
+        _real_flac(self.path("Artist", "Album", "01.flac"))
+        track = make_track(1, filename="01.flac")
+        app = self.run_shrink({"artist/album/01.flac": track})
+        app._redownload_track.assert_called_once()
+        self.assertIs(app._redownload_track.call_args[0][0], track)
+
+    @requires_ffmpeg
+    def test_an_ipod_sized_file_is_left_alone(self):
+        song = _real_flac(self.path("A", "B", "01.flac"), rate=44100,
+                          fmt="s16", bits="16")
+        before = os.path.getsize(song)
+        app = self.run_shrink()
+        app._ask_yes_no.assert_not_called()
+        self.assertEqual(os.path.getsize(song), before)
+
+    @requires_ffmpeg
+    def test_a_damaged_source_is_kept_not_replaced_by_a_short_copy(self):
+        song = _real_flac(self.path("A", "B", "01.flac"), seconds=30)
+        with open(song, "rb") as fh:
+            data = fh.read()
+        with open(song, "wb") as fh:
+            fh.write(data[:len(data) // 2])
+        before = os.path.getsize(song)
+        app = self.run_shrink()
+        self.assertEqual(os.path.getsize(song), before)
+        self.assertIn("looks damaged", "\n".join(app.logs))
+
+    @requires_ffmpeg
+    def test_declining_changes_nothing(self):
+        song = _real_flac(self.path("A", "B", "01.flac"))
+        before = os.path.getsize(song)
+        self.run_shrink(answer=False)
+        self.assertEqual(os.path.getsize(song), before)
+
+    @requires_ffmpeg
+    def test_no_local_copies_are_left_behind(self):
+        _real_flac(self.path("A", "B", "01.flac"))
+        _real_flac(self.path("A", "B", "02.flac"))
+        self.run_shrink()
+        self.assertEqual(os.listdir(self.staging_root), [])
+
+
+class FindClutterTests(IPodTestCase):
+    def put(self, *parts):
+        path = os.path.join(self.ipod.music_dir, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(b"x" * 10)
+        return path
+
+    def clutter(self):
+        found = self.p2i.sync.find_clutter(self.ipod.music_dir)
+        return [(os.path.relpath(p, self.ipod.music_dir).replace(os.sep, "/"),
+                 n, size) for p, n, size in found]
+
+    def test_a_release_folder_left_with_only_leftovers(self):
+        self.put("Release-xpost", "release.nfo")
+        self.put("Release-xpost", "release.sfv")
+        self.put("Release-xpost", "Scans", "front.jpg")
+        self.assertEqual(self.clutter(), [("Release-xpost", 3, 30)])
+
+    def test_download_tool_folders_inside_an_album_with_music(self):
+        self.put("Release", "01.flac")
+        self.put("Release", "cover.jpg")
+        self.put("Release", "__ADMIN__", "SABnzbd_nzf_abc")
+        self.assertEqual(self.clutter(), [("Release/__ADMIN__", 1, 10)])
+
+    def test_music_at_any_depth_protects_its_folders(self):
+        self.put("Box", "release.nfo")
+        self.put("Box", "CD1", "01.mp3")
+        self.assertEqual(self.clutter(), [])
+
+    def test_every_audio_kind_counts_as_music(self):
+        for ext in ("flac", "MP3", "m4a", "ogg", "opus", "wav", "ape", "wv"):
+            self.put("K-" + ext, "track." + ext)
+        self.assertEqual(self.clutter(), [])
+
+    def test_an_empty_device_has_nothing(self):
+        self.assertEqual(self.clutter(), [])
+
+
+class CleanUpTests(IPodTestCase):
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(self.p2i.app.messagebox, "showinfo")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_clean(self, answer=True):
+        app = self.bare_app()
+        app._ask_yes_no = mock.Mock(return_value=answer)
+        app._clean_up_worker(self.ipod.music_dir)
+        return app
+
+    def test_leftover_folders_are_deleted_and_music_kept(self):
+        junk = os.path.join(self.ipod.music_dir, "Release-xpost")
+        os.makedirs(junk)
+        open(os.path.join(junk, "release.nfo"), "w").close()
+        song = self.ipod.add_track("Artist", "Album", "01.flac")
+        app = self.run_clean()
+        self.assertFalse(os.path.exists(junk))
+        self.assertTrue(os.path.exists(song))
+        self.assertIn("removed 1 folder", "\n".join(app.logs))
+
+    def test_declining_deletes_nothing(self):
+        junk = os.path.join(self.ipod.music_dir, "Release-xpost")
+        os.makedirs(junk)
+        open(os.path.join(junk, "release.nfo"), "w").close()
+        self.run_clean(answer=False)
+        self.assertTrue(os.path.exists(junk))
+
+    def test_nothing_to_do_does_not_ask(self):
+        self.ipod.add_track("Artist", "Album", "01.flac")
+        app = self.run_clean()
+        app._ask_yes_no.assert_not_called()

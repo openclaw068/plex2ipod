@@ -319,7 +319,7 @@ class _ConvertingAudio(NoAudio):
         self.touched.append(path)
         return {"bit_depth": 24, "sample_rate": 96000}
 
-    def downsample(self, src, dst, timeout=300):
+    def downsample(self, src, dst, timeout=300, sample_rate=None):
         self.touched += [src, dst]
         with open(dst, "wb") as fh:
             fh.write(b"converted")
@@ -344,7 +344,8 @@ class StagingTests(SyncTestCase):
         [rel] = self.ipod.audio_files()
         with open(os.path.join(self.ipod.music_dir, rel), "rb") as fh:
             self.assertEqual(fh.read(), b"converted")
-        self.assertIn("Downsampled: 24-bit", "\n".join(app.logs))
+        self.assertIn("Converted: 24-bit/96 kHz \u2192 16-bit/48 kHz",
+                      "\n".join(app.logs))
 
     def test_downloads_are_not_written_to_the_ipod(self):
         app = self.build([make_track(1)])
@@ -426,8 +427,32 @@ class RealDownsampleTests(SyncTestCase):
         self.sync(app, downsample=True)
         [rel] = self.ipod.audio_files()
         landed = os.path.join(self.ipod.music_dir, rel)
-        self.assertEqual(app.audio.probe(landed)["bit_depth"], 16)
-        self.assertLess(os.path.getsize(landed), os.path.getsize(source))
+        self.assertEqual(app.audio.probe(landed),
+                         {"bit_depth": 16, "sample_rate": 48000})
+        self.assertLess(os.path.getsize(landed), os.path.getsize(source) / 2)
+        self.assertIn("24-bit/96 kHz \u2192 16-bit/48 kHz",
+                      "\n".join(app.logs))
+
+    def test_a_16_bit_96k_flac_is_resampled_too(self):
+        import shutil, subprocess, tempfile
+        work = tempfile.mkdtemp(prefix="plex2ipod-ffmpeg-")
+        self.addCleanup(shutil.rmtree, work, True)
+        source = os.path.join(work, "source.flac")
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                        "sine=frequency=440:duration=3", "-ar", "96000",
+                        "-sample_fmt", "s16", source], check=True)
+        app = self.build([make_track(1)], audio=self.p2i.AudioConverter())
+
+        def serve(part_key, dest_path, cancel_check=None, expected_size=0):
+            shutil.copyfile(source, dest_path + ".part")
+            return True, dest_path + ".part"
+
+        app.plex.download_part = serve
+        self.sync(app, downsample=True)
+        [rel] = self.ipod.audio_files()
+        self.assertEqual(
+            app.audio.probe(os.path.join(self.ipod.music_dir, rel)),
+            {"bit_depth": 16, "sample_rate": 48000})
 
 
 RELEASE = "Outkast-Original Album Classics-BOXSET-3CD-FLAC-2011-xpost"
@@ -633,3 +658,87 @@ class NoEmptyFoldersTests(SyncTestCase):
         self.sync(app)
         self.assertFalse(os.path.exists(
             os.path.join(self.ipod.music_dir, "Ghost")))
+
+
+class LaptopStorageTests(SyncTestCase):
+    """Each song's local copies are gone the moment it is on the iPod, so
+    a long sync never needs more than one song's worth of laptop space."""
+
+    def watch_staging(self, app):
+        """Record what is left in the staging folder after each track."""
+        leftovers = []
+        real = app._fetch_track
+
+        def fetch(track, dest, downsample, staging):
+            result = real(track, dest, downsample, staging)
+            leftovers.append(sorted(os.listdir(staging)))
+            return result
+
+        app._fetch_track = fetch
+        return leftovers
+
+    def test_nothing_is_left_after_each_song(self):
+        app = self.build([make_track(n) for n in range(3)],
+                         audio=_ConvertingAudio())
+        left = self.watch_staging(app)
+        self.sync(app, downsample=True)
+        self.assertEqual(left, [[], [], []])
+        self.assertEqual(len(self.ipod.audio_files()), 3)
+
+    def test_nothing_is_left_when_a_copy_fails(self):
+        app = self.build([make_track(1)], audio=_ConvertingAudio())
+        left = self.watch_staging(app)
+        with mock.patch.object(self.p2i.app.shutil, "copyfile",
+                               side_effect=OSError(28, "No space left")):
+            self.sync(app, downsample=True)
+        self.assertEqual(left, [[]])
+
+    def test_nothing_is_left_when_a_conversion_fails(self):
+        app = self.build([make_track(1)], audio=FailingAudio())
+        left = self.watch_staging(app)
+        self.sync(app, downsample=True)
+        self.assertEqual(left, [[]])
+
+    def test_staging_is_under_the_cache_folder_not_ram_backed_tmp(self):
+        app = self.build([make_track(1)])
+        seen = []
+        real = app._fetch_track
+
+        def fetch(track, dest, downsample, staging):
+            seen.append(staging)
+            return real(track, dest, downsample, staging)
+
+        app._fetch_track = fetch
+        self.sync(app)
+        self.assertTrue(seen[0].startswith(self.staging_root), seen[0])
+        self.assertEqual(os.listdir(self.staging_root), [],
+                         "the per-sync folder is removed at the end")
+
+    def test_folders_a_crash_left_behind_are_cleared(self):
+        import time
+        stale = os.path.join(self.staging_root, "plex2ipod-old")
+        fresh = os.path.join(self.staging_root, "plex2ipod-busy")
+        for path in (stale, fresh):
+            os.makedirs(path)
+        hour_ago = time.time() - 7200
+        os.utime(stale, (hour_ago, hour_ago))
+        made = self.p2i.App._new_staging()
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.exists(fresh), "another copy may be using it")
+        self.assertTrue(os.path.isdir(made))
+
+
+class StagingRootTests(unittest.TestCase):
+    def test_linux_uses_the_xdg_cache_folder(self):
+        paths = app_module().paths
+        with mock.patch.object(paths.sys, "platform", "linux"), \
+                mock.patch.dict(os.environ, {"XDG_CACHE_HOME": "/c"}):
+            self.assertEqual(paths.staging_root(), "/c/plex2ipod")
+
+    def test_linux_falls_back_to_dot_cache(self):
+        paths = app_module().paths
+        env = {k: v for k, v in os.environ.items() if k != "XDG_CACHE_HOME"}
+        with mock.patch.object(paths.sys, "platform", "linux"), \
+                mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(paths.staging_root(),
+                             os.path.expanduser("~/.cache/plex2ipod"))
