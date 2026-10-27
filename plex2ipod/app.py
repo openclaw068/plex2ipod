@@ -14,18 +14,20 @@ from urllib.error import HTTPError, URLError
 from xml.etree import ElementTree
 
 from .audio import (AudioConverter, converted_info, describe,
-                    ipod_sample_rate, needs_conversion)
+                    estimated_size, ipod_sample_rate, needs_conversion)
 from .config import CONFIG_DEFAULTS, ConfigManager
 from .naming import (find_path_collisions, ipod_rel_path,
                      sanitize_component, sort_key)
 from .paths import resource_dirs, staging_root
 from .platform_io import (IS_WINDOWS, detect_ipod_roots, disk_usage,
-                          eject_volume, list_ipod_roots, music_folder_name)
-from .plexapi import (PlexClient, plex_check_pin, plex_create_pin,
-                      plex_find_server,
+                          eject_volume, ipod_partitions, list_ipod_roots,
+                          mount_partition, music_folder_name)
+from .plexapi import (PlexClient, plex_account_name, plex_check_pin,
+                      plex_create_pin, plex_find_server,
                       plex_list_servers, plex_pick_connection)
-from .sync import (SyncEngine, find_clutter, group_by_name_and_size,
-                   index_device, relocation_source)
+from .sync import (AUDIO_EXTENSIONS, SyncEngine, find_clutter,
+                   group_by_name_and_size, group_by_size, index_device,
+                   relocation_source, size_match, tag_key)
 from .theme import THEMES
 from .version import APP_VERSION
 from .widgets import (CapacityBar, GlassCard, StyledButton,
@@ -69,8 +71,21 @@ class App:
         self._baseline_paths = set()
         self._baseline_playlists = set()
         self._prechecked = False
+        # The device the current ticks were matched against. A different
+        # one appearing (plugged in, mounted, picked) re-runs the pre-check.
+        self._prechecked_root = None
+        # iPod partitions this app has tried to mount since they were
+        # plugged in. Each is mounted at most once per plug-in, so one the
+        # user unmounts or ejects stays that way.
+        self._automount_tried = set()
+        self._automounting = False
         self._playlist_track_cache = {}
         self._playlist_fetching = set()
+        # Bit depth and sample rate per Plex track, fetched only to estimate
+        # what shrinking saves; rating keys asked for so far; fetches out.
+        self._track_formats = {}
+        self._formats_requested = set()
+        self._formats_fetching = 0
         # Un-ticking a playlist un-ticks its tracks in the library too.
         # _playlist_ticked tells a real un-tick from a var being rewritten
         # as False; _playlist_pending_untick holds playlists whose tracks
@@ -85,6 +100,7 @@ class App:
         # download, and what its deletions would free.
         self._ipod_sizes = {}
         self._ipod_by_name_size = {}
+        self._ipod_by_size = {}
         self._indexed_root = None
         self._capacity = None
         self._capacity_after = None
@@ -113,6 +129,26 @@ class App:
         self._build_ui()
         # Start watching for an iPod being plugged in.
         self.root.after(800, self._poll_ipod)
+        self.root.after(300, self._auto_connect)
+
+    def _auto_connect(self):
+        """Connect with the saved sign-in at startup. The token is kept in
+        config.json, so once signed in the Sign in button is never needed
+        again unless Plex revokes it."""
+        if self.plex is not None:
+            return
+        if not self._token_var.get().strip():
+            self._show_signed_out("Not signed in \u2014 click \u201cSign in "
+                                  "to Plex\u201d to get started.")
+            return
+        if self._url_var.get().strip():
+            self._status_var.set("Connecting with your saved Plex sign-in\u2026")
+            self._on_connect()
+
+    def _show_signed_out(self, message):
+        self._status_var.set(message)
+        self._status_label.configure(fg=self.t["fg_dim"])
+        self._signin_btn.set_text("Sign in to Plex")
 
     def _client_id(self):
         """Stable per-install id for plex.tv sign-in; created on demand."""
@@ -599,6 +635,9 @@ class App:
         self.root.option_add("*TCombobox*Listbox.selectForeground", "white")
 
     def _refresh_ipod_roots(self):
+        # An explicit refresh may mount an iPod that was unmounted earlier.
+        self._automount_tried.clear()
+        self._maybe_automount()
         ipods = detect_ipod_roots()
         values = ipods or list_ipod_roots()
         self._ipod_combo["values"] = values
@@ -626,6 +665,56 @@ class App:
         self._ipod_status_var.set("not found" if root else "")
         return False
 
+    def _maybe_automount(self):
+        """Mount a plugged-in iPod that the desktop left unmounted.
+
+        Many Linux desktops, KDE's default included, do not mount USB
+        drives on their own, and an unmounted iPod is invisible to the app.
+        Runs in the background; each partition is tried once per plug-in.
+        """
+        if IS_WINDOWS or self._automounting:
+            return
+        self._automounting = True
+        threading.Thread(target=self._automount_worker, daemon=True).start()
+
+    def _automount_worker(self):
+        mounted = []
+        try:
+            parts = ipod_partitions()
+            # Forget partitions that were unplugged, so the next plug-in
+            # mounts again.
+            present = {p["device"] for p in parts}
+            self._automount_tried &= present
+            for part in parts:
+                device = part["device"]
+                if part["mountpoint"] or device in self._automount_tried:
+                    continue
+                self._automount_tried.add(device)
+                self.root.after(0, self._log_msg,
+                                f"iPod found at {device}, mounting it...")
+                path, err = mount_partition(device)
+                if path:
+                    mounted.append(path)
+                    self.root.after(0, self._log_msg,
+                                    f"iPod mounted at {path}.")
+                else:
+                    self.root.after(
+                        0, self._log_msg,
+                        f"Could not mount the iPod ({err}). Open it once in "
+                        f"your file manager, then click the refresh button.")
+        except Exception as e:
+            self.root.after(0, self._log_msg, f"iPod auto-mount error: {e}")
+        finally:
+            self.root.after(0, self._automount_finished, mounted)
+
+    def _automount_finished(self, mounted):
+        self._automounting = False
+        if mounted and not self._update_ipod_status():
+            self._ipod_root_var.set(mounted[0])
+            self._update_ipod_status()
+        if mounted:
+            self._maybe_refresh_ipod_index()
+
     # How often the heartbeat runs. While we are still hunting for an iPod
     # we poll briskly so plugging one in feels instant; once one is selected
     # and present there is nothing to discover, so we back right off.
@@ -652,6 +741,11 @@ class App:
 
             if cur_valid or self._busy or self._syncing:
                 self._update_ipod_status()
+                # A saved or typed path that has just become valid (the
+                # iPod mounted where it was last time) needs indexing too.
+                # Cheap once done: it returns at once for an indexed root.
+                if cur_valid:
+                    self._maybe_refresh_ipod_index()
                 delay = self.POLL_SETTLED_MS
                 return
 
@@ -667,6 +761,7 @@ class App:
                     self._log_msg(f"iPod detected: {ipods[0]}")
             else:
                 self._ipod_announced = None
+                self._maybe_automount()
             self._update_ipod_status()
             self._maybe_refresh_ipod_index()
         finally:
@@ -690,7 +785,7 @@ class App:
 
     def _build_settings_card(self):
         self._settings_card = GlassCard(
-            self._main, self.t, height=100, bg=self.t["bg"],
+            self._main, self.t, height=100, bg=self.t["bg"], fit=True,
         )
         self._settings_card.pack(fill="x", pady=(0, 10))
         inner = self._settings_card.inner
@@ -1192,6 +1287,9 @@ class App:
         # Disabled/unchecked if ffmpeg isn't bundled.
         initial = bool(self.cfg.get("downsample_on_sync", True)) and self.audio.available
         self._downsample_var = tk.BooleanVar(value=initial)
+        # Shrinking changes what the selection costs.
+        self._downsample_var.trace_add(
+            "write", lambda *_a: self._schedule_capacity_update())
         self._downsample_cb = StyledCheckbutton(
             btn_frame,
             "Shrink hi-res FLACs (16-bit, \u226448 kHz)",
@@ -1217,6 +1315,22 @@ class App:
             fg=self.t["fg_dim"], font=("Segoe UI", 9), anchor="w",
         )
         self._capacity_label.pack(fill="x")
+
+        # Key to the bar's colors, each with its amount.
+        legend = tk.Frame(bar, bg=self.t["bg"])
+        legend.pack(fill="x")
+        self._capacity_legend = {}
+        for key, swatch, color in (("stays", "\u25a0", "cap_used"),
+                                   ("remove", "\u25a0", "cap_remove"),
+                                   ("add", "\u25a0", "cap_add"),
+                                   ("free", "\u25a1", "fg_dim")):
+            tk.Label(legend, text=swatch, bg=self.t["bg"], fg=self.t[color],
+                     font=("Segoe UI", 10)).pack(side="left")
+            var = tk.StringVar(value="")
+            tk.Label(legend, textvariable=var, bg=self.t["bg"],
+                     fg=self.t["fg_dim"], font=("Segoe UI", 9)).pack(
+                side="left", padx=(2, 12))
+            self._capacity_legend[key] = var
 
         # progress bar (canvas-drawn)
         self._progress_canvas = tk.Canvas(
@@ -1381,6 +1495,8 @@ class App:
             self._status_label.configure(fg=state["status_fg"])
         except tk.TclError:
             pass
+        if self.plex is not None and self._section_id:
+            self._signin_btn.set_text("Switch account")
 
         if state["playlists"]:
             self._populate_playlists(state["playlists"])
@@ -1672,21 +1788,33 @@ class App:
                             "\u2014 looking it up on plex.tv\u2026")
             found = plex_find_server(self._client_id(), token, url)
             if found and found[0] != url.rstrip("/"):
-                client = PlexClient(*found)
-                self.root.after(0, self._remember_server, *found)
+                url, token = found
+                client = PlexClient(url, token)
+                self.root.after(0, self._remember_server, url, token)
         try:
             self.plex = client
             playlists = self.plex.get_playlists()
             section_id = self.plex.get_music_section_id()
-            self.root.after(0, self._on_connected, playlists, section_id)
+            # Only for showing who and where; neither can stop a connect.
+            server = self.plex.server_name()
+            account = plex_account_name(self._client_id(), token)
+            self.root.after(0, self._on_connected, playlists, section_id,
+                            server, account)
         except HTTPError as e:
             if e.code == 401:
-                msg = ("Plex rejected the saved sign-in. Click \u201cSign in "
-                       "to Plex\u201d to sign in again.")
-            else:
-                msg = f"Connection failed: {e}"
-            self.root.after(0, self._status_var.set, msg)
+                self.plex = None
+                self.root.after(
+                    0, self._show_signed_out,
+                    "Your Plex sign-in has expired. Click \u201cSign in to "
+                    "Plex\u201d to sign in again.")
+                return
+            self.root.after(0, self._status_var.set,
+                            f"Connection failed: {e}")
         except (URLError, ElementTree.ParseError, OSError) as e:
+            self.root.after(0, self._status_var.set, f"Connection failed: {e}")
+        except Exception as e:
+            # Anything unforeseen would otherwise end this thread silently
+            # and leave the status reading "Connecting..." for good.
             self.root.after(0, self._status_var.set, f"Connection failed: {e}")
 
     def _remember_server(self, url, token):
@@ -1698,16 +1826,22 @@ class App:
         self.cfg_mgr.save(self.cfg)
         self._log_msg(f"Plex server moved; now using {url}.")
 
-    def _on_connected(self, playlists, section_id):
+    def _on_connected(self, playlists, section_id, server=None, account=None):
         self._section_id = section_id
-        count_text = f"{len(playlists)} playlists"
-        self._status_var.set(f"Connected  \u2022  {count_text}")
+        parts = [f"\u2713 Signed in as {account}" if account
+                 else "\u2713 Signed in"]
+        parts.append(f"Connected to {server}" if server else "Connected")
+        parts.append(f"{len(playlists)} playlists")
+        self._status_var.set("  \u2022  ".join(parts))
         self._status_label.configure(fg=self.t["success"])
+        self._signin_btn.set_text("Switch account")
 
         # Clear everything built against the previous server or session
         # first, so nothing below is undone by a later reset.
         self._playlist_track_cache.clear()
         self._playlist_fetching.clear()
+        self._track_formats = {}
+        self._formats_requested = set()
         self._playlist_ticked = set()
         self._playlist_pending_untick = set()
         self._playlist_removed_paths = set()
@@ -1723,6 +1857,7 @@ class App:
         self._baseline_paths = set()
         self._baseline_playlists = set()
         self._prechecked = False
+        self._prechecked_root = None
 
         # Now repopulate and reflect what is already on the device.
         self._maybe_refresh_ipod_index(force=True)
@@ -2932,6 +3067,7 @@ class App:
         # Anything already where some Plex track belongs stays put.
         claimed = {rel for rel in library if rel in files}
         plan = []
+        missing = []
         for rel, track in library.items():
             if rel in files:
                 continue
@@ -2939,7 +3075,77 @@ class App:
             if source:
                 claimed.add(source)
                 plan.append((track, source))
+            else:
+                missing.append(track)
+
+        # A copy renamed on the way to the iPod, folder and file alike, is
+        # still recognisable by its exact size. Here the whole library is
+        # known, so a size shared by two library tracks can be refused
+        # outright and no length check is needed.
+        library_sizes = {}
+        for track in library.values():
+            size = track.get("size") or 0
+            library_sizes[size] = library_sizes.get(size, 0) + 1
+        by_size = group_by_size(sizes)
+        for track in missing:
+            if library_sizes.get(track.get("size") or 0) != 1:
+                continue
+            source = size_match(track, by_size, claimed)
+            if source:
+                claimed.add(source)
+                plan.append((track, source))
         return plan
+
+    def _organize_by_tags(self, library, files, plan):
+        """More of `plan`, for music that neither its path nor its size
+        gives away: a re-tagged or re-encoded copy. Each remaining file's
+        tags must name exactly one library track of the same album artist,
+        album and title, and its length must agree within 3 s. A title
+        alone is not enough: the same song on another album would be filed
+        under the wrong one.
+
+        Reads every remaining file's header, so it reports progress and
+        honours Cancel.
+        """
+        if not self.audio.ffprobe_path:
+            return []
+        planned_tracks = {ipod_rel_path(t).lower() for t, _src in plan}
+        claimed_files = {src for _t, src in plan}
+        wanted = {}
+        for rel, track in library.items():
+            if rel in files or rel in planned_tracks:
+                continue
+            key = tag_key(track.get("artist"), track.get("album"),
+                          track.get("title"))
+            wanted.setdefault(key, []).append(track)
+        remaining = [rel for rel in files
+                     if rel.endswith(AUDIO_EXTENSIONS)
+                     and rel not in library and rel not in claimed_files]
+        found = []
+        taken = set()
+        for i, rel in enumerate(remaining):
+            if self._cancel:
+                break
+            if i % 20 == 0:
+                self.root.after(0, self._manage_status_var.set,
+                                f"Reading tags... {i}/{len(remaining)}")
+            tags = self.audio.read_tags(files[rel][0])
+            if not tags:
+                continue
+            key = tag_key(tags["album_artist"] or tags["artist"],
+                          tags["album"], tags["title"])
+            matches = [t for t in wanted.get(key, ())
+                       if abs((t.get("duration_ms") or 0) / 1000.0
+                              - tags["duration"]) <= 3]
+            if len(matches) != 1:
+                continue
+            track_key = ipod_rel_path(matches[0]).lower()
+            if track_key in taken:
+                continue      # a second copy of a song already matched
+            taken.add(track_key)
+            found.append((matches[0], rel))
+        self.root.after(0, self._manage_status_var.set, "")
+        return found
 
     def _organize_worker(self, root, music_root):
         moved = 0
@@ -2951,15 +3157,23 @@ class App:
                 return
             engine = SyncEngine(root)
             plan = self._organize_plan(library, files)
-            audio = [rel for rel in files
-                     if rel.endswith((".flac", ".mp3", ".m4a", ".ogg",
-                                      ".opus", ".wav", ".aac"))]
+            by_path = len(plan)
+            self.root.after(
+                0, self._log_msg,
+                f"Organize: {by_path} matched by path or size; reading the "
+                f"tags of the rest...")
+            plan += self._organize_by_tags(library, files, plan)
+            if self._cancel:
+                self.root.after(0, self._log_msg, "Organize cancelled.")
+                return
+            audio = [rel for rel in files if rel.endswith(AUDIO_EXTENSIONS)]
             in_place = sum(1 for rel in audio if rel in library)
             unmatched = len(audio) - in_place - len(plan)
             self.root.after(
                 0, self._log_msg,
                 f"Organize: {in_place} track(s) already in place, "
-                f"{len(plan)} to move, {unmatched} not found in Plex.")
+                f"{len(plan)} to move ({len(plan) - by_path} recognised by "
+                f"their tags), {unmatched} not matched to Plex.")
             if not plan:
                 self.root.after(0, lambda: messagebox.showinfo(
                     "Organize iPod",
@@ -2980,8 +3194,9 @@ class App:
                     "device: nothing is downloaded or deleted, and playlists "
                     "are updated to the new paths. Afterwards they show up "
                     "ticked, and sync will never download them again.\n\n"
-                    f"{unmatched} file(s) that match nothing in Plex stay "
-                    "where they are.\n\nContinue?"):
+                    f"{unmatched} file(s) that could not be matched to "
+                    "exactly one Plex track stay where they are.\n\n"
+                    "Continue?"):
                 self.root.after(0, self._log_msg, "Organize cancelled.")
                 return
 
@@ -3407,8 +3622,8 @@ class App:
         """Tick what is already on the iPod, once we know both sides.
 
         Needs the artist rows loaded and the device indexed. Runs once per
-        connection; the baseline it records is what a later sync is
-        allowed to delete.
+        connection and device; the baseline it records is what a later
+        sync is allowed to delete.
         """
         # Reached from the device-index worker, which can land before the
         # tree exists or after the window has gone.
@@ -3432,8 +3647,7 @@ class App:
             if folder not in artist_folders:
                 continue
             queued += 1
-            self._tree_pending_precheck.add(iid)
-            self._trigger_lazy_load(iid)
+            self._precheck_row(iid, self._precheck_albums)
         if queued:
             self._log_msg(
                 f"Found {queued} artist(s) already on the iPod — loading "
@@ -3458,8 +3672,17 @@ class App:
                 continue
             folder = sanitize_component(info["data"]["title"]).lower()
             if f"{artist_folder}/{folder}" in album_folders:
-                self._tree_pending_precheck.add(child)
-                self._trigger_lazy_load(child)
+                self._precheck_row(child, self._precheck_tracks)
+
+    def _precheck_row(self, iid, next_stage):
+        """Descend into an artist or album for the pre-check: straight away
+        if its children are already loaded (the Library tab was open when
+        the iPod appeared), else once its lazy load lands."""
+        if iid in self._tree_loaded:
+            next_stage(iid)
+        else:
+            self._tree_pending_precheck.add(iid)
+            self._trigger_lazy_load(iid)
 
     def _precheck_tracks(self, parent_iid):
         """An album queued for pre-check just got its tracks: tick the ones
@@ -3531,8 +3754,10 @@ class App:
         seen.add(rel)
         if self._ipod_index is not None and rel in self._ipod_index:
             return 0
-        if self._ipod_sizes and relocation_source(
-                track, self._ipod_sizes, self._ipod_by_name_size, claimed):
+        if self._ipod_sizes and (
+                relocation_source(track, self._ipod_sizes,
+                                  self._ipod_by_name_size, claimed)
+                or size_match(track, self._ipod_by_size, claimed)):
             return 0
         try:
             return max(int(track.get("size") or 0), 0)
@@ -3540,17 +3765,42 @@ class App:
             return 0
 
     def _selection_bytes(self):
-        """(bytes the selection would add, whether any size is still unknown).
+        """(bytes the selection would add, whether any size is still
+        unknown). See _selection_sizes."""
+        sizes = self._selection_sizes()
+        return sizes["add"], sizes["pending"]
 
-        Sizes come from Plex, so a hi-res FLAC that sync will shrink is
-        counted at its source size. That overestimates, which is the safe
-        direction for a capacity warning.
+    def _shrinking(self):
+        """True when sync will shrink hi-res FLACs."""
+        var = getattr(self, "_downsample_var", None)
+        return bool(var is not None and var.get()) and self.audio.available
+
+    def _selection_sizes(self):
+        """What syncing the selection would add to the iPod.
+
+        {"add": bytes it would take, "full": the same before shrinking,
+         "pending": a ticked playlist's tracks are still being listed,
+         "estimating": shrunk sizes are still being worked out}
+
+        With shrinking on, a hi-res FLAC counts at its estimated converted
+        size (audio.estimated_size). Its format comes from Plex in the
+        background; until it arrives the track counts at full size, the
+        safe direction for a capacity warning.
         """
         seen = set()
-        total = 0
+        full = added = 0
         pending = False
+        shrink = self._shrinking()
+        wanted = set()
         # Files where selected tracks belong are never moved away.
         claimed = self._selected_paths() if self._ipod_sizes else frozenset()
+
+        def count(track):
+            nonlocal full, added
+            size = self._track_bytes(track, seen, claimed)
+            full += size
+            added += self._after_shrink(track, size, wanted) if shrink else size
+
         for pid, (var, _pl) in self._playlist_vars.items():
             if not var.get():
                 continue
@@ -3559,10 +3809,55 @@ class App:
                 pending = True
                 continue
             for track in tracks:
-                total += self._track_bytes(track, seen, claimed)
+                count(track)
         for track in self._gather_library_tracks():
-            total += self._track_bytes(track, seen, claimed)
-        return total, pending
+            count(track)
+        if wanted:
+            self._fetch_formats(wanted)
+        return {"add": added, "full": full, "pending": pending,
+                "estimating": bool(wanted)
+                or bool(getattr(self, "_formats_fetching", 0))}
+
+    def _after_shrink(self, track, size, wanted):
+        """`size` once sync has shrunk the track; collects into `wanted`
+        the rating keys whose format is not known yet."""
+        name = (track.get("filename") or "").lower()
+        if not size or not (name.endswith(".flac")
+                            or (track.get("container") or "") == "flac"):
+            return size
+        key = track.get("rating_key")
+        info = self._track_formats.get(key) if key else None
+        if info is None:
+            if key:
+                wanted.add(key)
+            return size
+        return estimated_size(size, info)
+
+    def _fetch_formats(self, keys):
+        """Ask Plex for the formats of `keys`, in the background."""
+        keys = set(keys) - self._formats_requested
+        if not keys or not self.plex:
+            return
+        self._formats_requested |= keys
+        self._formats_fetching += 1
+        threading.Thread(target=self._formats_worker, args=(sorted(keys),),
+                         daemon=True).start()
+
+    def _formats_worker(self, keys):
+        try:
+            formats = self.plex.get_audio_formats(keys)
+        except (URLError, HTTPError, ElementTree.ParseError, OSError) as e:
+            self.root.after(0, self._log_msg,
+                            f"Could not read track formats from Plex: {e}")
+            formats = {}
+        self.root.after(0, self._store_formats, keys, formats)
+
+    def _store_formats(self, keys, formats):
+        self._formats_fetching = max(self._formats_fetching - 1, 0)
+        for key in keys:
+            # A track Plex said nothing about counts at full size.
+            self._track_formats[key] = formats.get(key) or {}
+        self._schedule_capacity_update()
 
     def _freed_bytes(self):
         """Space the pending deletions will give back. Sync removes them
@@ -3577,6 +3872,11 @@ class App:
             freed += self._ipod_sizes.get(rel.lower(), 0)
         return freed
 
+    def _set_legend(self, **texts):
+        """Fill the color key under the capacity bar; blank when omitted."""
+        for key, var in getattr(self, "_capacity_legend", {}).items():
+            var.set(texts.get(key, ""))
+
     def _recompute_capacity(self):
         self._capacity_after = None
         if not hasattr(self, "_capacity_bar"):
@@ -3586,30 +3886,47 @@ class App:
             self._capacity = None
             self._capacity_bar.set_values(0, 0, 0)
             self._capacity_var.set("No iPod connected")
+            self._set_legend()
             self._capacity_label.configure(fg=self.t["fg_dim"])
             return
 
         total, used, free = usage
-        selected, pending = self._selection_bytes()
-        freed = self._freed_bytes()
+        sizes = self._selection_sizes()
+        selected = sizes["add"]
+        freed = min(self._freed_bytes(), used)
         over = max(selected - free - freed, 0)
+        used_after = used - freed + selected
         self._capacity = {"total": total, "used": used, "free": free,
-                          "selected": selected, "freed": freed, "over": over}
-        # The bar shows the device as it will be: removals come off "used".
-        self._capacity_bar.set_values(total, max(used - freed, 0), selected)
+                          "selected": selected, "full": sizes["full"],
+                          "freed": freed, "over": over}
+        self._capacity_bar.set_values(total, used, selected, freed)
 
-        text = (f"{self._human_size(used)} used  \u2022  "
-                f"{self._human_size(selected)} selected  \u2022  ")
-        if freed:
-            text += f"{self._human_size(freed)} to remove  \u2022  "
-        text += f"{self._human_size(free)} free of {self._human_size(total)}"
-        if pending:
-            text += "  \u2022  sizing playlists\u2026"
+        size = self._human_size
+        text = (f"Now: {size(used)} used, {size(free)} free of "
+                f"{size(total)}     \u2192     After sync: ")
         if over:
-            text += f"    \u26a0 {self._human_size(over)} over capacity"
+            text += f"\u26a0 {size(over)} more than the iPod can hold"
+        else:
+            text += (f"{size(used_after)} used, "
+                     f"{size(total - used_after)} free")
+        notes = []
+        if sizes["pending"]:
+            notes.append("sizing playlists\u2026")
+        if sizes["estimating"] and self._shrinking():
+            notes.append("estimating shrunk sizes\u2026")
+        if notes:
+            text += "  (" + ", ".join(notes) + ")"
         self._capacity_var.set(text)
         self._capacity_label.configure(
             fg=self.t["error"] if over else self.t["fg_dim"])
+
+        add = f"+{size(selected)} to add"
+        if self._shrinking() and sizes["full"] > selected:
+            add += f" (shrunk from {size(sizes['full'])})"
+        self._set_legend(stays=f"{size(used - freed)} staying",
+                         remove=f"\u2212{size(freed)} to remove",
+                         add=add,
+                         free=f"{size(max(total - used_after, 0))} free after")
 
     # -- what is already on the device --
 
@@ -3660,9 +3977,20 @@ class App:
     def _set_ipod_sizes(self, sizes):
         self._ipod_sizes = sizes
         self._ipod_by_name_size = group_by_name_and_size(sizes)
+        self._ipod_by_size = group_by_size(sizes)
 
     def _set_ipod_index(self, index):
         self._ipod_index = index
+        if self._indexed_root != self._prechecked_root:
+            # A device appeared since the ticks were last matched against
+            # one: plugged in after connecting, mounted late, or picked by
+            # hand. Match again, and forget the old device's baseline so a
+            # sync can never delete by another device's list.
+            self._prechecked_root = self._indexed_root
+            self._baseline_paths = set()
+            self._baseline_playlists = set()
+            self._prechecked = False
+            self._precheck_playlists()
         self._schedule_capacity_update()
         self._maybe_precheck()
 
@@ -3952,6 +4280,10 @@ class App:
         try:
             ok, msg = eject_volume(root)
             if ok:
+                # If it stays visible (power-off is best effort), do not
+                # mount it straight back.
+                self._automount_tried.update(
+                    p["device"] for p in ipod_partitions())
                 self.root.after(0, self._log_msg,
                                 f"iPod ({root}) ejected safely. You can unplug it now.")
                 self.root.after(0, self._status_var.set, "iPod ejected")
@@ -4193,6 +4525,7 @@ class App:
             return []
         sizes = {rel: size for rel, (_full, size) in files.items()}
         by_name_size = group_by_name_and_size(sizes)
+        by_size = group_by_size(sizes)
         claimed = set(claimed)
         moved = []
         renames = {}
@@ -4200,6 +4533,8 @@ class App:
             if self._cancel:
                 break
             rel = relocation_source(t, sizes, by_name_size, claimed)
+            if rel is None:
+                rel = self._verified_size_match(t, files, by_size, claimed)
             if rel is None:
                 continue
             src = files[rel][0]
@@ -4220,6 +4555,19 @@ class App:
             self._rewrite_m3u_paths(renames)
             self._cleanup_empty_dirs(self.sync_engine.ipod_music_dir())
         return moved
+
+    def _verified_size_match(self, track, files, by_size, claimed):
+        """size_match, confirmed by the file's length. Sync only knows the
+        selected tracks, so it cannot rule out another library track of
+        the same size; a song of the right length as well is."""
+        rel = size_match(track, by_size, claimed)
+        if rel is None or not self.audio.ffprobe_path:
+            return None
+        expected = (track.get("duration_ms") or 0) / 1000.0
+        actual = self._header_duration(files[rel][0])
+        if expected and actual and abs(actual - expected) <= 2:
+            return rel
+        return None
 
     def _rewrite_m3u_paths(self, renames):
         """Point playlist entries at files that were moved on the iPod.

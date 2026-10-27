@@ -10,6 +10,7 @@ The iPod's audio hardware tops out at 48 kHz, so Rockbox resamples a
 twice the USB transfer time and extra battery, for nothing audible.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -54,6 +55,25 @@ def converted_info(info):
     info = info or {}
     rate = info.get("sample_rate")
     return {"bit_depth": 16, "sample_rate": ipod_sample_rate(rate) or rate}
+
+
+def estimated_size(size, info):
+    """Bytes a FLAC of `size` will take once converted for the iPod.
+
+    Scaled by the bits and samples kept. Measured against real conversions
+    this is exact for resampled files (96 kHz to 48 kHz keeps 33%, 192 kHz
+    to 48 kHz 17%) and about ten points high for 24-bit to 16-bit at the
+    same rate (58% rather than 67%): the safe direction for a capacity
+    warning.
+    """
+    if not needs_conversion(info):
+        return size
+    bits = info.get("bit_depth") or 16
+    rate = info.get("sample_rate")
+    ratio = 16.0 / bits if bits > 16 else 1.0
+    if rate:
+        ratio *= converted_info(info)["sample_rate"] / rate
+    return int(size * ratio)
 
 
 class AudioConverter:
@@ -151,6 +171,32 @@ class AudioConverter:
             return info
         except (subprocess.TimeoutExpired, OSError):
             return None
+
+    def read_tags(self, file_path):
+        """{"artist", "album_artist", "album", "title", "duration"} for a
+        file, from its header (no decoding, so cheap over USB), or None.
+        Missing tags come back as ""."""
+        if not self.ffprobe_path:
+            return None
+        try:
+            result = subprocess.run(
+                [self.ffprobe_path, "-v", "error", "-show_entries",
+                 "format_tags=artist,album_artist,album,title"
+                 ":format=duration", "-of", "json", file_path],
+                timeout=15, stdin=subprocess.DEVNULL,
+                **self._no_console_kwargs())
+            fmt = json.loads(result.stdout or "{}").get("format") or {}
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            return None
+        tags = {k.lower(): v for k, v in (fmt.get("tags") or {}).items()}
+        try:
+            duration = float(fmt.get("duration") or 0)
+        except ValueError:
+            duration = 0.0
+        info = {k: tags.get(k, "") for k in
+                ("artist", "album_artist", "album", "title")}
+        info["duration"] = duration
+        return info
 
     def downsample(self, src, dst, timeout=600, sample_rate=None):
         """Convert src -> dst as 16-bit FLAC, resampled to sample_rate when

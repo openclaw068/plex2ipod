@@ -132,6 +132,19 @@ def plex_pick_connection(server, timeout=5):
         pool.shutdown(wait=False)
 
 
+def plex_account_name(client_id, token):
+    """The signed-in Plex account's username, or None if plex.tv cannot
+    be asked. Only used to show who is signed in."""
+    try:
+        req = Request(f"{PLEX_TV}/user",
+                      headers=_plex_headers(client_id, token))
+        with urlopen(req, timeout=10) as resp:
+            info = json.load(resp)
+    except (URLError, HTTPError, OSError, ValueError):
+        return None
+    return info.get("username") or info.get("title") or None
+
+
 def plex_find_server(client_id, token, previous_url=""):
     """Ask plex.tv where the account's server can be reached now.
 
@@ -169,6 +182,13 @@ class PlexClient:
     def __init__(self, base_url, token):
         self.base_url = base_url.rstrip("/")
         self.token = token
+
+    def server_name(self):
+        """The server's own name ("homelab"), or None."""
+        try:
+            return self._request("/").get("friendlyName") or None
+        except (URLError, HTTPError, ElementTree.ParseError, OSError):
+            return None
 
     def ping(self, timeout=5):
         """True if a Plex server answers at base_url. One quick try, so a
@@ -299,6 +319,36 @@ class PlexClient:
                 break
         return tracks
 
+    # Track details per request in get_audio_formats: 200 come back in a
+    # third of a second, and a URL of 200 ids stays well within limits.
+    FORMAT_BATCH = 200
+
+    def get_audio_formats(self, rating_keys):
+        """{rating key: {"bit_depth": int or None, "sample_rate": int or
+        None}} for the given tracks.
+
+        List responses (playlists, albums) carry no stream details, so
+        they are fetched as full metadata, many tracks per request.
+        """
+        keys = [k for k in dict.fromkeys(rating_keys) if k]
+        formats = {}
+        for start in range(0, len(keys), self.FORMAT_BATCH):
+            batch = keys[start:start + self.FORMAT_BATCH]
+            root = self._request("/library/metadata/" + ",".join(batch))
+            for el in root.findall("Track"):
+                stream = next((s for s in el.iter("Stream")
+                               if s.get("streamType") == "2"), None)
+                info = {"bit_depth": None, "sample_rate": None}
+                if stream is not None:
+                    for name, attr in (("bit_depth", "bitDepth"),
+                                       ("sample_rate", "samplingRate")):
+                        try:
+                            info[name] = int(stream.get(attr) or 0) or None
+                        except ValueError:
+                            pass
+                formats[el.get("ratingKey")] = info
+        return formats
+
     def get_music_section_id(self):
         root = self._request("/library/sections/")
         for el in root.findall("Directory"):
@@ -389,6 +439,7 @@ class PlexClient:
         except ValueError:
             size = 0
         return {
+            "rating_key": el.get("ratingKey", ""),
             "title": el.get("title", ""),
             "artist": el.get("grandparentTitle", ""),
             "album": el.get("parentTitle", ""),

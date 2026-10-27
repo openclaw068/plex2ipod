@@ -196,8 +196,8 @@ class StyledWidgetTests(unittest.TestCase):
 
 
 @requires_tk
-class AppLifecycleTests(unittest.TestCase):
-    """Exercises the real App, including the connect path."""
+class RealAppFixture:
+    """A real App against a stub Plex, with no tests of its own."""
 
     def setUp(self):
         self.p2i = app_module()
@@ -247,6 +247,12 @@ class AppLifecycleTests(unittest.TestCase):
                 for i in self.app._tree.get_children()]
 
     # -- construction --
+
+
+@requires_tk
+class AppLifecycleTests(RealAppFixture, unittest.TestCase):
+    """Exercises the real App, including the connect path."""
+
     def test_builds_three_tabs_and_can_switch_between_them(self):
         app = self.start_app()
         self.assertEqual(len(app._tab_frames), 3)
@@ -891,7 +897,35 @@ class CapacityBarTests(unittest.TestCase):
         self.bar.update_theme(self.p2i.THEMES["light"])
         self.root.update()
         colours = {self.bar.itemcget(i, "fill") for i in self.bar.find_all()}
-        self.assertIn(self.p2i.THEMES["light"]["progress_fill"], colours)
+        self.assertIn(self.p2i.THEMES["light"]["cap_add"], colours)
+
+    def colours(self):
+        self.root.update()
+        return {self.bar.itemcget(i, "fill") for i in self.bar.find_all()}
+
+    def test_used_space_is_visible_against_the_empty_track(self):
+        # It used to be drawn in a color one shade off the track itself.
+        for name, theme in self.p2i.THEMES.items():
+            with self.subTest(theme=name):
+                self.assertNotEqual(theme["cap_used"].lower(),
+                                    theme["progress_bg"].lower())
+                self.bar.update_theme(theme)
+                self.bar.set_values(100, 60, 0)
+                self.assertIn(theme["cap_used"], self.colours())
+
+    def test_removals_get_their_own_colour(self):
+        theme = self.p2i.THEMES["dark"]
+        self.bar.set_values(100, 60, 10, removing=20)
+        self.assertIn(theme["cap_remove"], self.colours())
+
+    def test_removals_make_room_for_additions(self):
+        self.bar.set_values(100, 90, 30, removing=25)
+        self.assertEqual(self.bar.overflow, 0)
+        self.assertNotIn(self.p2i.THEMES["dark"]["error"], self.colours())
+
+    def test_removing_more_than_is_used_is_clamped(self):
+        self.bar.set_values(100, 10, 0, removing=50)
+        self.assertEqual(self.bar._removing, 10)
 
 
 @requires_tk
@@ -918,7 +952,7 @@ class CapacityReadoutTests(unittest.TestCase):
         self.app._ipod_root_var.set(os.path.abspath(os.sep))
         self.app._recompute_capacity()
         text = self.app._capacity_var.get()
-        for word in ("used", "selected", "free of"):
+        for word in ("Now:", "used", "free of", "After sync:"):
             self.assertIn(word, text)
         self.assertIsNotNone(self.app._capacity)
         self.assertEqual(self.app._capacity["over"], 0)
@@ -933,7 +967,7 @@ class CapacityReadoutTests(unittest.TestCase):
         self.app._gather_library_tracks = lambda: [huge]
         self.app._recompute_capacity()
         self.assertGreater(self.app._capacity["over"], 0)
-        self.assertIn("over capacity", self.app._capacity_var.get())
+        self.assertIn("more than the iPod can hold", self.app._capacity_var.get())
         self.assertEqual(self.app._capacity_label.cget("fg"),
                          self.app.t["error"])
 
@@ -998,6 +1032,8 @@ class PrecheckFixture:
     playlist_tracks = ()
     # Whether the Library tab is open when the connection lands.
     open_library = True
+    # Whether the iPod is already selected when the connection lands.
+    ipod_at_connect = True
 
     def setUp(self):
         import shutil, tempfile
@@ -1033,7 +1069,8 @@ class PrecheckFixture:
 
         self.app = self.p2i.App()
         self.app.root.geometry("900x700" + OFFSCREEN)
-        self.app._ipod_root_var.set(self.ipod)
+        if self.ipod_at_connect:
+            self.app._ipod_root_var.set(self.ipod)
         self.app.root.update()
         self.addCleanup(lambda: destroy_tk(self.app.root))
         self._connect()
@@ -1059,10 +1096,15 @@ class PrecheckFixture:
         self.app.root.after(ms, self.app.root.quit)
         self.app.root.mainloop()
 
-    def row(self, label, parent=""):
-        for iid in self.app._tree.get_children(parent):
-            if label in self.app._tree.item(iid, "text"):
-                return iid
+    def row(self, label, parent="", wait_ms=5000):
+        """The row whose text contains `label`. Loads land from worker
+        threads, so on a busy machine a row can still be on its way: keep
+        the event loop running for up to `wait_ms` before giving up."""
+        for _ in range(max(wait_ms // 100, 1)):
+            for iid in self.app._tree.get_children(parent):
+                if label in self.app._tree.item(iid, "text"):
+                    return iid
+            self.pump(100)
         return None
 
     def mark(self, iid):
@@ -1254,3 +1296,158 @@ class PlaylistOnlyUntickTests(PrecheckFixture, unittest.TestCase):
             sorted(os.path.basename(p)
                    for p in self.app._pending_deletions()[0]),
             ["01 Everything.flac", "01 Packt.flac"])
+
+
+@requires_tk
+class LateIpodTests(PrecheckFixture, unittest.TestCase):
+    """The iPod turns up after connecting to Plex: plugged in later, or
+    mounted late at the path saved from last time. What is on it must
+    still show up ticked."""
+
+    ipod_at_connect = False
+    open_library = False
+
+    def attach(self):
+        # What the heartbeat sees once the saved path becomes valid.
+        self.app._ipod_root_var.set(self.ipod)
+        self.app._poll_ipod()
+        self.pump(1500)
+
+    def test_nothing_is_ticked_before_the_ipod_appears(self):
+        self.assertFalse(self.app._playlist_vars["1"][0].get())
+
+    def test_its_playlists_are_ticked_when_it_appears(self):
+        self.attach()
+        self.assertTrue(self.app._playlist_vars["1"][0].get())
+        self.assertIn("1", self.app._baseline_playlists)
+
+    def test_its_music_is_ticked_when_the_library_opens_later(self):
+        self.attach()
+        self.app._select_tab(1)
+        self.pump()
+        self.assertEqual(self.mark(self.row("Radiohead")), "☒")
+        self.assertEqual(self.mark(self.row("Kid A", self.row("Radiohead"))),
+                         "☑")
+
+    def test_its_music_is_ticked_with_the_library_already_open(self):
+        self.app._select_tab(1)
+        self.pump()
+        self.app._set_checked(self.row("Radiohead"), False)  # loads nothing
+        self.attach()
+        self.pump()
+        self.assertEqual(self.mark(self.row("Kid A", self.row("Radiohead"))),
+                         "☑")
+
+    def test_already_loaded_artists_are_ticked_too(self):
+        # Library open and Radiohead expanded before the iPod appears: its
+        # rows are loaded, so the pre-check must not wait for a lazy load
+        # that will never come.
+        self.app._select_tab(1)
+        self.pump()
+        radiohead = self.row("Radiohead")
+        self.app._trigger_lazy_load(radiohead)
+        self.pump()
+        for album in self.app._tree.get_children(radiohead):
+            self.app._trigger_lazy_load(album)
+        self.pump()
+        self.attach()
+        self.pump()
+        self.assertEqual(self.mark(self.row("Kid A", radiohead)), "☑")
+        self.assertEqual(len(self.app._baseline_paths), 3)
+
+    def test_a_different_device_replaces_the_baseline(self):
+        self.attach()
+        self.assertIn("1", self.app._baseline_playlists)
+        import shutil, tempfile
+        other = tempfile.mkdtemp(prefix="plex2ipod-other-")
+        self.addCleanup(shutil.rmtree, other, True)
+        os.makedirs(os.path.join(other, "Music"))
+        self.app._ipod_root_var.set(other)
+        self.app._poll_ipod()
+        self.pump(1500)
+        self.assertEqual(self.app._baseline_playlists, set())
+        self.assertEqual(self.app._baseline_paths, set())
+
+
+@requires_tk
+class SignedInStateTests(RealAppFixture, unittest.TestCase):
+    """A saved sign-in connects by itself at startup and says so, so the
+    Sign in button is never needed twice."""
+
+    def setUp(self):
+        super().setUp()
+        self._account = self.p2i.app.plex_account_name
+        self.p2i.app.plex_account_name = lambda cid, token: "grayson"
+        self.addCleanup(setattr, self.p2i.app, "plex_account_name",
+                        self._account)
+
+    def save_sign_in(self, token="tok"):
+        import json
+        with open(os.path.join(self._cfg.dir, "config.json"), "w") as fh:
+            json.dump({"plex_url": "http://127.0.0.1:32400",
+                       "plex_token": token}, fh)
+
+    def settle(self, ms=1500):
+        self.run_steps([(ms, lambda a: None)])
+
+    def test_a_saved_sign_in_connects_at_startup(self):
+        self.save_sign_in()
+        app = self.start_app()
+        self.settle()
+        self.assertIsNotNone(app.plex)
+        self.assertEqual(app._status_var.get(),
+                         "✓ Signed in as grayson  •  Connected to "
+                         "Test Server  •  1 playlists")
+
+    def test_the_sign_in_button_offers_to_switch_account(self):
+        self.save_sign_in()
+        app = self.start_app()
+        self.settle()
+        self.assertEqual(app._signin_btn._text, "Switch account")
+
+    def test_it_survives_a_theme_toggle(self):
+        self.save_sign_in()
+        app = self.start_app()
+        self.settle()
+        app._toggle_theme()
+        app.root.update()
+        self.assertEqual(app._signin_btn._text, "Switch account")
+        self.assertIn("Signed in as grayson", app._status_var.get())
+
+    def test_without_a_sign_in_it_says_what_to_do(self):
+        self.save_sign_in(token="")
+        app = self.start_app()
+        self.settle(600)
+        self.assertIsNone(app.plex)
+        self.assertIn("Not signed in", app._status_var.get())
+        self.assertEqual(app._signin_btn._text, "Sign in to Plex")
+
+
+@requires_tk
+class SettingsCardFitTests(RealAppFixture, unittest.TestCase):
+    """Nothing in the settings card is cut off: its height follows its
+    content instead of a guess measured against Windows fonts."""
+
+    def assert_fully_visible(self, app):
+        card = app._settings_card
+        inner = card.inner
+        self.assertGreaterEqual(card.winfo_height(),
+                                inner.winfo_reqheight() + 2 * card.pad)
+        for widget in (app._connect_btn, app._status_label, app._signin_btn):
+            bottom = (widget.winfo_rooty() + widget.winfo_height()
+                      - inner.winfo_rooty())
+            self.assertLessEqual(bottom, inner.winfo_height(),
+                                 f"{widget} is cut off")
+
+    def test_at_the_default_size(self):
+        app = self.start_app()
+        for _ in range(5):
+            app.root.update()
+        self.assert_fully_visible(app)
+
+    def test_at_the_minimum_size(self):
+        app = self.start_app()
+        app.root.geometry("750x550" + OFFSCREEN)
+        for _ in range(5):
+            app.root.update()
+        self.assert_fully_visible(app)

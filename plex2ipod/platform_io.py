@@ -4,7 +4,9 @@ Linux (mount points under /media etc., udisks). Everything else in the
 app works in terms of an "iPod root path".
 """
 
+import json
 import os
+import re
 import shutil
 import subprocess
 
@@ -80,6 +82,66 @@ def looks_like_ipod(root):
 def detect_ipod_roots():
     """Candidate roots that actually look like an iPod, best first."""
     return [r for r in list_ipod_roots() if looks_like_ipod(r)]
+
+
+def ipod_partitions():
+    """Music partitions of the iPods plugged in, mounted or not (Linux).
+
+    Returns [{"device": "/dev/sdb2", "mountpoint": "/run/media/..." or
+    None}, ...]. An iPod is recognised by the USB identity of its disk
+    (model "iPod"), never by a guess at its contents, so no other drive
+    is ever touched. Rockbox needs FAT32, so only vfat partitions count.
+    Empty on Windows, or when lsblk is missing.
+    """
+    if IS_WINDOWS or not shutil.which("lsblk"):
+        return []
+    try:
+        out = _no_console_run(
+            ["lsblk", "-J", "-o", "PATH,PKNAME,FSTYPE,MOUNTPOINT,MODEL"],
+            timeout=10).stdout
+        top = json.loads(out or "{}").get("blockdevices") or []
+    except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError):
+        return []
+
+    # Depending on version and columns, lsblk nests partitions under their
+    # disk or lists everything flat. Flatten, then tie each partition to
+    # its disk through PKNAME, which both shapes carry.
+    devices = []
+    stack = list(top)
+    while stack:
+        dev = stack.pop(0)
+        if isinstance(dev, dict):
+            devices.append(dev)
+            stack.extend(dev.get("children") or [])
+    models = {dev.get("path"): (dev.get("model") or "").lower()
+              for dev in devices}
+    found = []
+    for dev in devices:
+        parent = "/dev/" + (dev.get("pkname") or "")
+        if (dev.get("fstype") == "vfat" and dev.get("path")
+                and "ipod" in models.get(parent, "")):
+            found.append({"device": dev["path"],
+                          "mountpoint": dev.get("mountpoint") or None})
+    return found
+
+
+def mount_partition(device):
+    """Mount a partition the way the desktop does: through udisks, as the
+    logged-in user, under /run/media/<user>. Returns (mount point, None)
+    or (None, error message)."""
+    try:
+        r = _no_console_run(
+            ["udisksctl", "mount", "-b", device, "--no-user-interaction"],
+            timeout=30)
+    except FileNotFoundError:
+        return None, "udisksctl not found (install udisks2)"
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, str(e)
+    if r.returncode != 0:
+        return None, (r.stderr or r.stdout or "mount failed").strip()
+    # "Mounted /dev/sdb2 at /run/media/you/IPOD" (older versions add a ".")
+    match = re.search(r" at (.+?)\.?$", (r.stdout or "").strip())
+    return (match.group(1) if match else None), None
 
 
 def music_folder_name(root):

@@ -20,6 +20,11 @@ THEMES = {
         "glass_border":   "#262a38",
         "progress_bg":    "#1a1c25",
         "progress_fill":  "#e94560",
+        # Capacity bar: space that stays, space a sync frees, space it
+        # fills. Distinct hues, each visible against the empty track.
+        "cap_used":       "#7d8493",
+        "cap_remove":     "#f0a35e",
+        "cap_add":        "#4f8ff7",
         "scrollbar":      "#2c303d",
         "scrollbar_hover":"#3a3f4f",
         "check_on":       "#e94560",
@@ -56,6 +61,9 @@ THEMES = {
         "glass_border":   "#e4e7ec",
         "progress_bg":    "#eef0f4",
         "progress_fill":  "#e94560",
+        "cap_used":       "#94a3b8",
+        "cap_remove":     "#f59e0b",
+        "cap_add":        "#2563eb",
         "scrollbar":      "#d4d8e0",
         "scrollbar_hover":"#b2b8c4",
         "check_on":       "#e94560",

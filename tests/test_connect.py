@@ -96,6 +96,9 @@ class _Client:
     def get_music_section_id(self):
         return "3"
 
+    def server_name(self):
+        return "homelab"
+
 
 class ConnectWorkerTests(IPodTestCase):
     def run_connect(self, alive, found=None, status=None):
@@ -106,12 +109,17 @@ class ConnectWorkerTests(IPodTestCase):
         app._url_var = mock.Mock()
         app._token_var = mock.Mock()
         app._on_connected = mock.Mock()
+        app._status_label = mock.Mock()
+        app._signin_btn = mock.Mock()
+        app.t = {"fg_dim": "#888"}
         client = type("C", (_Client,), {"alive": set(alive),
                                         "status": status})
         module = self.p2i.app
         with mock.patch.object(module, "PlexClient", client), \
                 mock.patch.object(module, "plex_find_server",
-                                  return_value=found) as finder:
+                                  return_value=found) as finder, \
+                mock.patch.object(module, "plex_account_name",
+                                  return_value="grayson"):
             app._connect_worker()
         app.finder = finder
         return app
@@ -141,6 +149,13 @@ class ConnectWorkerTests(IPodTestCase):
         app = self.run_connect({URL}, status=401)
         last = app._status_var.set.call_args[0][0]
         self.assertIn("Sign in to Plex", last)
+        app._signin_btn.set_text.assert_called_with("Sign in to Plex")
+        self.assertIsNone(app.plex)
+
+    def test_who_and_where_are_passed_on(self):
+        app = self.run_connect({URL})
+        args = app._on_connected.call_args[0]
+        self.assertEqual(args[2:], ("homelab", "grayson"))
 
 
 if __name__ == "__main__":

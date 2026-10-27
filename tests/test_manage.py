@@ -6,6 +6,7 @@ import os
 import unittest
 from unittest import mock
 
+import helpers
 from helpers import (IPodTestCase, make_track, requires_ffmpeg,
                      requires_ffprobe)
 
@@ -605,8 +606,8 @@ class OrganizeTests(IPodTestCase):
         self.put("Bootlegs", "live.flac")
         app = self.run_organize([t])
         log = "\n".join(app.logs)
-        self.assertIn("0 track(s) already in place, 1 to move, "
-                      "1 not found in Plex", log)
+        self.assertIn("0 track(s) already in place, 1 to move (0 recognised "
+                      "by their tags), 1 not matched to Plex", log)
         self.assertIn("Organize complete: 1 track(s) moved", log)
 
 
@@ -782,3 +783,143 @@ class CleanUpTests(IPodTestCase):
         self.ipod.add_track("Artist", "Album", "01.flac")
         app = self.run_clean()
         app._ask_yes_no.assert_not_called()
+
+
+class OrganizeRenamedCopyTests(IPodTestCase):
+    """Copies renamed on the way to the iPod, folder and file, as found on
+    a real device: "The Cure/Bloodflowers (2000)/The Cure - Bloodflowers -
+    01 - Out of This World.flac" for Plex's ".../Bloodflowers/1. Out of
+    This World.flac", byte for byte the same file."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(self.p2i.app.messagebox, "showinfo")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def put(self, *parts, size=4096, path=None):
+        path = path or os.path.join(self.ipod.music_dir, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(b"\1" * size)
+        return path
+
+    def track(self, n, size, title="Out of This World", album="Bloodflowers",
+              duration_ms=404300):
+        return make_track(n, artist="The Cure", album=album, title=title,
+                          filename="%d. %s.flac" % (n, title), size=size,
+                          duration_ms=duration_ms,
+                          server_path="/music/The Cure/%s/%d. %s.flac"
+                          % (album, n, title))
+
+    def plan(self, tracks, audio=None):
+        app = self.bare_app(audio=audio or self.p2i.AudioConverter())
+        app._manage_status_var = mock.Mock()
+        library = {self.p2i.ipod_rel_path(t).lower(): t for t in tracks}
+        files, _ = self.p2i.sync.index_device(self.ipod.music_dir)
+        plan = app._organize_plan(library, files)
+        plan += app._organize_by_tags(library, files, plan)
+        return [(src, self.p2i.ipod_rel_path(t)) for t, src in plan]
+
+    def test_a_renamed_copy_is_matched_by_its_exact_size(self):
+        self.put("The Cure", "Bloodflowers (2000)",
+                 "The Cure - Bloodflowers - 01 - Out of This World.flac",
+                 size=45159)
+        self.assertEqual(self.plan([self.track(1, 45159)]), [(
+            "the cure/bloodflowers (2000)/the cure - bloodflowers - 01 - "
+            "out of this world.flac",
+            "The Cure/Bloodflowers/1. Out of This World.flac")])
+
+    def test_a_size_two_library_tracks_share_is_not_trusted(self):
+        self.put("Elsewhere", "x.flac", size=45159)
+        twins = [self.track(1, 45159), self.track(2, 45159, title="Other")]
+        self.assertEqual(self.plan(twins, audio=helpers.NoAudio()), [])
+
+    def test_a_different_file_type_is_not_a_size_match(self):
+        self.put("Elsewhere", "x.mp3", size=45159)
+        self.assertEqual(self.plan([self.track(1, 45159)],
+                                   audio=helpers.NoAudio()), [])
+
+    @requires_ffmpeg
+    def test_a_re_tagged_copy_is_matched_by_its_tags(self):
+        song = self.tagged_flac("The Cure", "Bloodflowers", "Out of This World")
+        track = self.track(1, os.path.getsize(song) + 999,
+                           duration_ms=int(self.length(song) * 1000))
+        self.assertEqual([dst for _s, dst in self.plan([track])],
+                         ["The Cure/Bloodflowers/1. Out of This World.flac"])
+
+    @requires_ffmpeg
+    def test_tags_must_agree_on_the_album(self):
+        # The same song on another album is not this track.
+        song = self.tagged_flac("The Cure", "Greatest Hits",
+                                "Out of This World")
+        track = self.track(1, os.path.getsize(song) + 999,
+                           duration_ms=int(self.length(song) * 1000))
+        self.assertEqual(self.plan([track]), [])
+
+    @requires_ffmpeg
+    def test_tags_must_agree_on_the_length(self):
+        song = self.tagged_flac("The Cure", "Bloodflowers", "Out of This World")
+        track = self.track(1, os.path.getsize(song) + 999,
+                           duration_ms=int(self.length(song) * 1000) + 10000)
+        self.assertEqual(self.plan([track]), [])
+
+    @requires_ffmpeg
+    def test_two_library_tracks_with_the_same_tags_are_ambiguous(self):
+        song = self.tagged_flac("The Cure", "Bloodflowers", "Out of This World")
+        ms = int(self.length(song) * 1000)
+        editions = [self.track(1, 1, duration_ms=ms),
+                    self.track(2, 2, duration_ms=ms)]
+        self.assertEqual(self.plan(editions), [])
+
+    @requires_ffmpeg
+    def test_punctuation_and_asides_do_not_matter(self):
+        song = self.tagged_flac("the cure", "Kiss Me Kiss Me Kiss Me",
+                                "Why Can't I Be You (Remastered)")
+        track = self.track(1, 1, album="Kiss Me, Kiss Me, Kiss Me",
+                           title="Why Can't I Be You?",
+                           duration_ms=int(self.length(song) * 1000))
+        self.assertEqual(len(self.plan([track])), 1)
+
+    def tagged_flac(self, artist, album, title):
+        import subprocess
+        path = os.path.join(self.ipod.music_dir, "Release-xpost",
+                            "%s - %s.flac" % (artist, title))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                        "sine=frequency=440:duration=6",
+                        "-metadata", "album_artist=" + artist,
+                        "-metadata", "artist=" + artist,
+                        "-metadata", "album=" + album,
+                        "-metadata", "title=" + title, path],
+                       check=True, capture_output=True, timeout=60)
+        return path
+
+    def length(self, path):
+        return self.p2i.AudioConverter().read_tags(path)["duration"]
+
+
+class SizeMatchTests(unittest.TestCase):
+    def setUp(self):
+        self.sync = helpers.app_module().sync
+
+    def match(self, sizes, track, claimed=()):
+        return self.sync.size_match(track, self.sync.group_by_size(sizes),
+                                    set(claimed))
+
+    def test_the_one_file_of_that_size_and_type(self):
+        t = make_track(1, filename="1. Song.flac", size=500)
+        self.assertEqual(self.match({"a/b.flac": 500, "a/c.flac": 7}, t),
+                         "a/b.flac")
+
+    def test_two_files_of_that_size_are_ambiguous(self):
+        t = make_track(1, filename="1. Song.flac", size=500)
+        self.assertIsNone(self.match({"a/b.flac": 500, "x/y.flac": 500}, t))
+
+    def test_a_claimed_file_is_never_offered(self):
+        t = make_track(1, filename="1. Song.flac", size=500)
+        self.assertIsNone(self.match({"a/b.flac": 500}, t, ["a/b.flac"]))
+
+    def test_no_size_means_no_match(self):
+        t = make_track(1, filename="1. Song.flac", size=0)
+        self.assertIsNone(self.match({"a/b.flac": 0}, t))

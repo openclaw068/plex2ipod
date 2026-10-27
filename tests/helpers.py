@@ -196,6 +196,9 @@ class StubPlex:
     def ping(self, timeout=5):
         return True
 
+    def server_name(self):
+        return "Test Server"
+
     def get_playlists(self):
         return list(self._playlists)
 
@@ -354,6 +357,13 @@ class IPodTestCase(unittest.TestCase):
         original = module.staging_root
         module.staging_root = lambda: self.staging_root
         self.addCleanup(setattr, module, "staging_root", original)
+        # Never find, let alone mount, a real iPod that happens to be
+        # plugged in while the tests run.
+        for name, stub in (("ipod_partitions", lambda: []),
+                           ("mount_partition",
+                            lambda device: (None, "disabled in tests"))):
+            self.addCleanup(setattr, module, name, getattr(module, name))
+            setattr(module, name, stub)
 
     def bare_app(self, **attrs):
         """An App with __init__ skipped and the common collaborators stubbed.
@@ -381,12 +391,16 @@ class IPodTestCase(unittest.TestCase):
         app._playlist_vars = {}
         app._playlist_track_cache = {}
         app._playlist_fetching = set()
+        app._track_formats = {}
+        app._formats_requested = set()
+        app._formats_fetching = 0
         app._playlist_ticked = set()
         app._playlist_pending_untick = set()
         app._playlist_removed_paths = set()
         app._ipod_index = None
         app._ipod_sizes = {}
         app._ipod_by_name_size = {}
+        app._ipod_by_size = {}
         app._indexed_root = None
         app._capacity = None
         app._capacity_after = None
@@ -395,6 +409,9 @@ class IPodTestCase(unittest.TestCase):
         app._baseline_paths = set()
         app._baseline_playlists = set()
         app._prechecked = False
+        app._prechecked_root = None
+        app._automount_tried = set()
+        app._automounting = False
         for key, value in attrs.items():
             setattr(app, key, value)
         return app
@@ -420,19 +437,26 @@ class TempAppDir:
         self._original = self.config_module.app_dir
         self._detect = (self.app_module.detect_ipod_roots,
                         self.app_module.list_ipod_roots,
-                        self.app_module.staging_root)
+                        self.app_module.staging_root,
+                        self.app_module.ipod_partitions,
+                        self.app_module.mount_partition)
 
     def __enter__(self):
         self.config_module.app_dir = lambda: self.dir
         self.app_module.detect_ipod_roots = lambda: []
         self.app_module.list_ipod_roots = lambda: []
         self.app_module.staging_root = lambda: os.path.join(self.dir, "stage")
+        # Auto-mount would otherwise find and mount a real plugged-in iPod.
+        self.app_module.ipod_partitions = lambda: []
+        self.app_module.mount_partition = lambda device: (None, "test")
         return self.dir
 
     def __exit__(self, *exc):
         self.config_module.app_dir = self._original
         (self.app_module.detect_ipod_roots,
          self.app_module.list_ipod_roots,
-         self.app_module.staging_root) = self._detect
+         self.app_module.staging_root,
+         self.app_module.ipod_partitions,
+         self.app_module.mount_partition) = self._detect
         shutil.rmtree(self.dir, ignore_errors=True)
         return False

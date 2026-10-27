@@ -11,7 +11,7 @@ import tkinter.font as tkfont
 class GlassCard(tk.Canvas):
     """A rounded-rectangle card with subtle border glow."""
 
-    def __init__(self, parent, theme, radius=14, pad=16, **kw):
+    def __init__(self, parent, theme, radius=14, pad=16, fit=False, **kw):
         super().__init__(parent, highlightthickness=0, bd=0, **kw)
         self.radius = radius
         self.pad = pad
@@ -21,6 +21,21 @@ class GlassCard(tk.Canvas):
             pad, pad, window=self.inner, anchor="nw"
         )
         self.bind("<Configure>", self._on_resize)
+        if fit:
+            # Size to the content rather than to a height guessed in
+            # advance: fonts differ between platforms, and a fixed height
+            # that fits Windows cuts off the bottom row elsewhere.
+            self.inner.bind("<Configure>", self.fit_to_content, add="+")
+            self.after_idle(self.fit_to_content)
+
+    def fit_to_content(self, _event=None):
+        """Make the card exactly tall enough for what is inside it."""
+        try:
+            want = self.inner.winfo_reqheight() + 2 * self.pad
+            if int(self.cget("height")) != want:
+                self.configure(height=want)
+        except tk.TclError:
+            pass
 
     def _on_resize(self, event):
         w, h = event.width, event.height
@@ -158,6 +173,16 @@ class StyledButton(tk.Canvas):
         self._disabled = not enabled
         self._draw(self._bg if enabled else self._disabled_bg)
 
+    def set_text(self, text):
+        """Change the label, resizing the button to fit it."""
+        if text == self._text:
+            return
+        self._text = text
+        self._width = max(self._natural_width(text, self._font),
+                          self.MIN_WIDTH)
+        self.configure(width=self._width)
+        self._draw(self._disabled_bg if self._disabled else self._bg)
+
 
 class StyledCheckbutton(tk.Frame):
     """A modern checkbox with colored indicator."""
@@ -242,13 +267,13 @@ class StyledCheckbutton(tk.Frame):
 
 
 class CapacityBar(tk.Canvas):
-    """A stacked bar showing how full the iPod is and how much the current
-    selection would add.
+    """A stacked bar showing how full the iPod is now and after a sync.
 
-    Three segments: what is already on the device, what syncing would add,
-    and free space. When the selection does not fit, the part that would
-    not fit is drawn in the error color so the overflow is visible at a
-    glance rather than only being reported at sync time.
+    Segments, left to right: what stays on the device, what the sync will
+    remove (on the device now, gone after), what it will add, and free
+    space. When the additions do not fit, the part that would not fit is
+    drawn in the error color so the overflow is visible at a glance rather
+    than only being reported at sync time.
     """
 
     HEIGHT = 14
@@ -260,21 +285,26 @@ class CapacityBar(tk.Canvas):
         self._total = 0
         self._used = 0
         self._selected = 0
+        self._removing = 0
         self.bind("<Configure>", lambda _e: self._draw())
 
-    def set_values(self, total, used, selected):
-        """total/used/selected in bytes. total of 0 means 'no iPod'."""
+    def set_values(self, total, used, selected, removing=0):
+        """Bytes. used is what the device holds now, selected what a sync
+        adds, removing what it deletes (part of used). total of 0 means
+        'no iPod'."""
         self._total = max(int(total or 0), 0)
         self._used = max(int(used or 0), 0)
         self._selected = max(int(selected or 0), 0)
+        self._removing = min(max(int(removing or 0), 0), self._used)
         self._draw()
 
     @property
     def overflow(self):
-        """Bytes by which the selection exceeds free space, else 0."""
+        """Bytes by which the device would be over-full after the sync."""
         if not self._total:
             return 0
-        return max(self._used + self._selected - self._total, 0)
+        return max(self._used - self._removing + self._selected
+                   - self._total, 0)
 
     def update_theme(self, theme):
         self.theme = theme
@@ -295,19 +325,22 @@ class CapacityBar(tk.Canvas):
             return
 
         # Everything is scaled against the larger of the device size and
-        # the projected total, so an overflowing selection still fits on
-        # screen and the overflow reads as a proportion.
+        # what is drawn, so an overflowing selection still fits on screen
+        # and the overflow reads as a proportion. Removals are drawn as
+        # well as additions, since both are on screen at once.
         scale_max = max(self._total, self._used + self._selected)
-        used_w = int(width * self._used / scale_max)
-        fits = max(min(self._selected, self._total - self._used), 0)
-        fits_w = int(width * fits / scale_max)
-        over_w = int(width * (self._selected - fits) / scale_max)
+        stays = self._used - self._removing
+        fits = max(min(self._selected, self._total - stays), 0)
+
+        def px(amount):
+            return int(width * amount / scale_max)
 
         x = 0
         for segment_w, color in (
-            (used_w, t["accent2"]),
-            (fits_w, t["progress_fill"]),
-            (over_w, t["error"]),
+            (px(stays), t["cap_used"]),
+            (px(self._removing), t["cap_remove"]),
+            (px(fits), t["cap_add"]),
+            (px(self._selected - fits), t["error"]),
         ):
             if segment_w <= 0:
                 continue

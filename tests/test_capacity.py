@@ -257,3 +257,149 @@ class CapacityCreditTests(IPodTestCase):
     def test_nothing_is_credited_without_deletions(self):
         app = self.make_app([], {"artist/album/kept.flac": 6000})
         self.assertEqual(app._freed_bytes(), 0)
+
+
+class RenamedCopyCapacityTests(IPodTestCase):
+    def test_a_renamed_copy_costs_nothing(self):
+        track = make_track(1, album="Bloodflowers", filename="1. Song.flac",
+                           size=45159781)
+        app = self.bare_app()
+        app._playlist_vars = {}
+        app._gather_library_tracks = lambda: [track]
+        app._ipod_index = {}
+        app._set_ipod_sizes(
+            {"artist/bloodflowers (2000)/artist - 01 - song.flac": 45159781})
+        self.assertEqual(app._selection_bytes()[0], 0)
+
+
+class EstimatedSizeTests(unittest.TestCase):
+    """What shrinking leaves of a file, against real conversions measured
+    on hi-res tracks (see audio.estimated_size)."""
+
+    def setUp(self):
+        self.estimate = app_module().audio.estimated_size
+
+    def test_ipod_sized_files_are_unchanged(self):
+        self.assertEqual(self.estimate(1000, {"bit_depth": 16,
+                                              "sample_rate": 44100}), 1000)
+
+    def test_24_bit_same_rate(self):
+        # Measured 56-60%; the estimate errs high.
+        self.assertEqual(self.estimate(3000, {"bit_depth": 24,
+                                              "sample_rate": 48000}), 2000)
+
+    def test_24_bit_96k(self):
+        # Measured 30-34%.
+        self.assertEqual(self.estimate(3000, {"bit_depth": 24,
+                                              "sample_rate": 96000}), 1000)
+
+    def test_24_bit_192k(self):
+        # Measured 15-19%.
+        self.assertEqual(self.estimate(6000, {"bit_depth": 24,
+                                              "sample_rate": 192000}), 1000)
+
+    def test_16_bit_96k_is_only_resampled(self):
+        self.assertEqual(self.estimate(1000, {"bit_depth": 16,
+                                              "sample_rate": 96000}), 500)
+
+    def test_an_unknown_format_is_unchanged(self):
+        self.assertEqual(self.estimate(1000, {}), 1000)
+
+
+class ShrinkAwareSelectionTests(IPodTestCase):
+    """With the shrink box ticked, the selection costs what will actually
+    land on the iPod."""
+
+    def make_app(self, tracks, shrink=True, formats=None):
+        app = self.bare_app()
+        app.audio = type("A", (), {"available": True})()
+        app._downsample_var = type("V", (), {
+            "get": staticmethod(lambda: shrink)})()
+        app._playlist_vars = {}
+        app._gather_library_tracks = lambda: list(tracks)
+        app._track_formats = dict(formats or {})
+        app.plex = mock.Mock()
+        app.plex.get_audio_formats = mock.Mock(return_value={})
+        return app
+
+    def hires(self, n, size=3000):
+        return make_track(n, filename="%02d.flac" % n, size=size,
+                          rating_key=str(n))
+
+    def test_a_known_hi_res_track_counts_at_its_shrunk_size(self):
+        app = self.make_app([self.hires(1)], formats={
+            "1": {"bit_depth": 24, "sample_rate": 96000}})
+        sizes = app._selection_sizes()
+        self.assertEqual((sizes["add"], sizes["full"]), (1000, 3000))
+
+    def test_unticked_shrink_counts_full_size(self):
+        app = self.make_app([self.hires(1)], shrink=False, formats={
+            "1": {"bit_depth": 24, "sample_rate": 96000}})
+        self.assertEqual(app._selection_sizes()["add"], 3000)
+
+    def test_an_unknown_format_counts_full_and_is_fetched(self):
+        app = self.make_app([self.hires(1), self.hires(2)])
+        app._fetch_formats = mock.Mock()
+        sizes = app._selection_sizes()
+        self.assertEqual(sizes["add"], 6000)
+        self.assertTrue(sizes["estimating"])
+        app._fetch_formats.assert_called_once_with({"1", "2"})
+
+    def test_formats_are_fetched_once(self):
+        app = self.make_app([self.hires(1)])
+        with mock.patch.object(self.p2i.app.threading, "Thread") as thread:
+            app._fetch_formats({"1"})
+            app._fetch_formats({"1"})
+        self.assertEqual(thread.call_count, 1)
+
+    def test_storing_formats_updates_the_estimate(self):
+        app = self.make_app([self.hires(1)])
+        app._schedule_capacity_update = mock.Mock()
+        app._formats_fetching = 1
+        app._store_formats(["1"], {"1": {"bit_depth": 24,
+                                         "sample_rate": 192000}})
+        self.assertEqual(app._selection_sizes()["add"], 500)
+        app._schedule_capacity_update.assert_called_once()
+
+    def test_a_track_plex_says_nothing_about_counts_in_full(self):
+        app = self.make_app([self.hires(1)])
+        app._schedule_capacity_update = mock.Mock()
+        app._store_formats(["1"], {})
+        self.assertEqual(app._selection_sizes()["add"], 3000)
+
+    def test_mp3s_are_never_shrunk(self):
+        mp3 = make_track(1, filename="01.mp3", size=3000, container="mp3",
+                         rating_key="1")
+        app = self.make_app([mp3], formats={
+            "1": {"bit_depth": 24, "sample_rate": 96000}})
+        self.assertEqual(app._selection_sizes()["add"], 3000)
+
+
+class AudioFormatParseTests(unittest.TestCase):
+    def test_reads_bit_depth_and_rate_from_batched_metadata(self):
+        from xml.etree import ElementTree
+        plexapi = app_module().plexapi
+        client = plexapi.PlexClient("http://x", "t")
+        xml = ('<MediaContainer>'
+               '<Track ratingKey="1"><Media><Part><Stream streamType="2" '
+               'bitDepth="24" samplingRate="96000"/></Part></Media></Track>'
+               '<Track ratingKey="2"><Media><Part><Stream streamType="2" '
+               'samplingRate="44100"/></Part></Media></Track>'
+               '<Track ratingKey="3"><Media><Part/></Media></Track>'
+               '</MediaContainer>')
+        client._request = mock.Mock(return_value=ElementTree.fromstring(xml))
+        formats = client.get_audio_formats(["1", "2", "3"])
+        self.assertEqual(formats, {
+            "1": {"bit_depth": 24, "sample_rate": 96000},
+            "2": {"bit_depth": None, "sample_rate": 44100},
+            "3": {"bit_depth": None, "sample_rate": None}})
+        client._request.assert_called_once_with("/library/metadata/1,2,3")
+
+    def test_large_requests_are_batched(self):
+        from xml.etree import ElementTree
+        plexapi = app_module().plexapi
+        client = plexapi.PlexClient("http://x", "t")
+        client._request = mock.Mock(
+            return_value=ElementTree.fromstring("<MediaContainer/>"))
+        client.get_audio_formats([str(i) for i in range(450)])
+        self.assertEqual(client._request.call_count, 3)

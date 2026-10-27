@@ -2,6 +2,8 @@
 
 import os
 import posixpath
+import re
+import unicodedata
 
 from .naming import ipod_rel_path, sanitize_component
 from .platform_io import music_folder_name
@@ -149,6 +151,61 @@ def group_by_name_and_size(sizes):
     for rel, size in sizes.items():
         groups.setdefault((posixpath.basename(rel), size), []).append(rel)
     return groups
+
+
+def group_by_size(sizes):
+    """{size: [rel, ...]} from {rel: size}."""
+    groups = {}
+    for rel, size in sizes.items():
+        groups.setdefault(size, []).append(rel)
+    return groups
+
+
+def _track_size(track):
+    try:
+        return int(track.get("size") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _extension(track):
+    name = track.get("filename") or ""
+    ext = posixpath.splitext(name)[1].lower()
+    if not ext and track.get("container"):
+        ext = "." + track["container"].lower().lstrip(".")
+    return ext
+
+
+def size_match(track, by_size, claimed):
+    """The one unclaimed file on the iPod with exactly this track's size
+    and file type, or None.
+
+    A FLAC's byte count is close to a fingerprint, so this finds copies
+    that were renamed on the way to the iPod, folder and file alike
+    ("Bloodflowers (2000)/The Cure - Bloodflowers - 01 - Out of This
+    World.flac" for ".../Bloodflowers/1. Out of This World.flac"). It is
+    not proof on its own: a caller that cannot also see that no other
+    library track shares the size must confirm the length before acting.
+    """
+    size = _track_size(track)
+    if size <= 0:
+        return None
+    ext = _extension(track)
+    matches = [rel for rel in by_size.get(size, ()) if rel not in claimed]
+    if len(matches) == 1 and posixpath.splitext(matches[0])[1] == ext:
+        return matches[0]
+    return None
+
+
+def tag_key(artist, album, title):
+    """Comparable (artist, album, title): case, accents, punctuation and
+    bracketed asides such as "(Remastered 2011)" are ignored."""
+    def norm(text):
+        text = unicodedata.normalize("NFKD", text or "").casefold()
+        text = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", text)
+        text = re.sub(r"[^\w]+", " ", text)
+        return " ".join(text.split())
+    return norm(artist), norm(album), norm(title)
 
 
 def relocation_source(track, sizes, by_name_size, claimed):

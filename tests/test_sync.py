@@ -742,3 +742,49 @@ class StagingRootTests(unittest.TestCase):
                 mock.patch.dict(os.environ, env, clear=True):
             self.assertEqual(paths.staging_root(),
                              os.path.expanduser("~/.cache/plex2ipod"))
+
+
+@unittest.skipUnless(__import__("shutil").which("ffmpeg"), "needs ffmpeg")
+class RenamedCopyTests(SyncTestCase):
+    """A copy renamed on its way to the iPod, folder and file, found by its
+    exact size. Sync sees only the selected tracks, so it also checks the
+    length before moving anything."""
+
+    def renamed_copy(self, seconds=5):
+        import subprocess
+        path = os.path.join(self.ipod.music_dir, "The Cure",
+                            "Bloodflowers (2000)",
+                            "The Cure - Bloodflowers - 01 - Out of This World.flac")
+        os.makedirs(os.path.dirname(path))
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                        "sine=frequency=440:duration=%d" % seconds, path],
+                       check=True, capture_output=True, timeout=60)
+        return path
+
+    def track(self, path, duration_ms):
+        return make_track(1, artist="The Cure", album="Bloodflowers",
+                          filename="1. Out of This World.flac",
+                          size=os.path.getsize(path), duration_ms=duration_ms)
+
+    def test_moved_into_place_when_the_length_agrees(self):
+        copy = self.renamed_copy()
+        app = self.build([self.track(copy, 5000)],
+                         audio=self.p2i.AudioConverter())
+        self.sync(app)
+        self.assertEqual(app.plex.downloads, 0)
+        self.assertEqual(self.ipod.audio_files(),
+                         ["The Cure/Bloodflowers/1. Out of This World.flac"])
+
+    def test_downloaded_when_the_length_disagrees(self):
+        copy = self.renamed_copy()
+        app = self.build([self.track(copy, 95000)],
+                         audio=self.p2i.AudioConverter())
+        self.sync(app)
+        self.assertEqual(app.plex.downloads, 1)
+        self.assertTrue(os.path.exists(copy))
+
+    def test_downloaded_when_the_length_cannot_be_checked(self):
+        copy = self.renamed_copy()
+        app = self.build([self.track(copy, 5000)])        # no ffprobe
+        self.sync(app)
+        self.assertEqual(app.plex.downloads, 1)
