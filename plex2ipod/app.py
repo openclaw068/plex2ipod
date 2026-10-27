@@ -423,8 +423,15 @@ class App:
             new_y = d["wy"] + (d["h"] - new_h)
         self.root.geometry(f"{new_w}x{new_h}+{new_x}+{new_y}")
 
+    # The window's WM_CLASS. Desktop launchers name it (StartupWMClass) so
+    # the dock groups the running window under its pinned icon; left to
+    # Tk it would follow however the script happened to be started. Tk
+    # lowercases all but the first letter of the class, so this is the
+    # form it already takes: install_linux_launcher.sh uses the same.
+    WM_CLASS = "Plex2ipod"
+
     def _build_ui(self):
-        self.root = tk.Tk()
+        self.root = tk.Tk(className=self.WM_CLASS)
         self.root.title("Plex2iPod")
         self.root.geometry("900x700")
         self.root.minsize(750, 550)
@@ -446,12 +453,19 @@ class App:
         # frosted backdrop). Silently no-ops on older Windows or non-Windows.
         self._apply_win11_chrome()
 
-        # Window icon — search beside the script and inside the PyInstaller bundle
+        # Window icon — search beside the script and inside the PyInstaller
+        # bundle. Only Windows Tk reads .ico; Linux and macOS take a PNG.
+        icon_file = "Plex2iPod.ico" if IS_WINDOWS else "Plex2iPod_logo.png"
         try:
             for d in resource_dirs():
-                p = os.path.join(d, "Plex2iPod.ico")
+                p = os.path.join(d, icon_file)
                 if os.path.exists(p):
-                    self.root.iconbitmap(p)
+                    if IS_WINDOWS:
+                        self.root.iconbitmap(p)
+                    else:
+                        # Kept on self: Tk drops an image nothing references.
+                        self._icon_image = tk.PhotoImage(file=p)
+                        self.root.iconphoto(True, self._icon_image)
                     break
         except Exception:
             pass

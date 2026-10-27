@@ -71,6 +71,16 @@ bash run_on_linux.sh
 
 It will tell you if you're missing `python3-tk`, `ffmpeg`, or `udisks2`.
 
+To open it like any other app, from the app menu or a dock icon:
+
+```bash
+bash install_linux_launcher.sh
+```
+
+Then launch Plex2iPod from the menu, right-click its taskbar icon and pin
+it. The launcher points at this folder, so re-run the script if you move
+it; `--remove` takes it out again.
+
 ### ffmpeg
 
 ffmpeg and ffprobe power the downsampling features. They're optional — without
