@@ -224,6 +224,116 @@ class ApplyDeletionTests(IPodTestCase):
         self.assertTrue(os.path.exists(b))
 
 
+class PlaylistUntickCascadeTests(IPodTestCase):
+    """Un-ticking a playlist un-ticks its tracks in the library, except the
+    ones another ticked playlist still uses."""
+
+    SHARED = make_track(1, filename="shared.flac")
+    ONLY_A = make_track(2, filename="only-a.flac")
+
+    def make_app(self, a_ticked=True, b_ticked=True, cached=True):
+        app = self.bare_app()
+        app._playlist_vars = {
+            "a": (_Var(a_ticked), {"id": "a", "title": "A"}),
+            "b": (_Var(b_ticked), {"id": "b", "title": "B"})}
+        app._playlist_ticked = {pid for pid, (var, _pl)
+                                in app._playlist_vars.items() if var.get()}
+        if cached:
+            app._playlist_track_cache = {"a": [self.SHARED, self.ONLY_A],
+                                         "b": [self.SHARED]}
+        # Two library rows, both ticked by the pre-check.
+        app._tree_data = {"t1": {"type": "track", "data": self.SHARED},
+                          "t2": {"type": "track", "data": self.ONLY_A}}
+        app._tree_checked = {"t1": True, "t2": True}
+        app._set_checked = lambda iid, state: app._tree_checked.__setitem__(
+            iid, state)
+        app._refresh_ancestor_marks = lambda iid: None
+        app._schedule_capacity_update = lambda: None
+        return app
+
+    def untick(self, app, pid):
+        app._playlist_vars[pid][0].set(False)
+        app._on_playlist_toggled(pid)
+
+    def test_only_tracks_no_other_playlist_uses_are_unticked(self):
+        app = self.make_app()
+        self.untick(app, "a")
+        self.assertEqual(app._tree_checked, {"t1": True, "t2": False})
+
+    def test_with_no_other_playlist_everything_is_unticked(self):
+        app = self.make_app(b_ticked=False)
+        self.untick(app, "a")
+        self.assertEqual(app._tree_checked, {"t1": False, "t2": False})
+
+    def test_the_log_says_what_was_unticked(self):
+        app = self.make_app()
+        self.untick(app, "a")
+        self.assertTrue(any("Un-ticked 1 track" in m for m in app.logs),
+                        app.logs)
+
+    def test_an_untick_waits_for_tracks_still_loading(self):
+        app = self.make_app(b_ticked=False, cached=False)
+        app._ensure_playlist_tracks = lambda pid: None
+        self.untick(app, "a")
+        self.assertEqual(app._tree_checked, {"t1": True, "t2": True})
+        self.assertEqual(app._playlist_pending_untick, {"a"})
+        app._store_playlist_tracks("a", [self.SHARED, self.ONLY_A])
+        self.assertEqual(app._tree_checked, {"t1": False, "t2": False})
+        self.assertEqual(app._playlist_pending_untick, set())
+
+    def test_reticking_before_the_tracks_arrive_cancels_the_cascade(self):
+        app = self.make_app(b_ticked=False, cached=False)
+        app._ensure_playlist_tracks = lambda pid: None
+        self.untick(app, "a")
+        app._playlist_vars["a"][0].set(True)
+        app._on_playlist_toggled("a")
+        app._store_playlist_tracks("a", [self.SHARED, self.ONLY_A])
+        self.assertEqual(app._tree_checked, {"t1": True, "t2": True})
+
+
+class PlaylistBaselineTests(IPodTestCase):
+    """A pre-checked playlist's tracks may be deleted; nothing else's."""
+
+    def make_app(self, pid_in_baseline=True):
+        track = make_track(1, artist="Artist", album="Album",
+                           filename="a.flac")
+        path = self.ipod.add_track("Artist", "Album", "a.flac")
+        app = self.bare_app()
+        app._ipod_index = {"artist/album/a.flac": path}
+        app._playlist_vars = {"1": (_Var(False), {"id": "1",
+                                                  "title": "Workout"})}
+        app._playlist_track_cache = {"1": [track]}
+        app._baseline_playlists = {"1"} if pid_in_baseline else set()
+        app._gather_library_tracks = lambda: []
+        return app
+
+    def test_an_unticked_prechecked_playlist_queues_its_tracks(self):
+        tracks, _ = self.make_app()._pending_deletions()
+        self.assertEqual([os.path.basename(p) for p in tracks], ["a.flac"])
+
+    def test_a_playlist_the_app_never_prechecked_queues_nothing(self):
+        tracks, _ = self.make_app(pid_in_baseline=False)._pending_deletions()
+        self.assertEqual(tracks, [])
+
+    def test_a_track_not_on_the_device_is_not_queued(self):
+        app = self.make_app()
+        app._ipod_index = {}
+        self.assertEqual(app._pending_deletions()[0], [])
+
+
+class SyncWaitsForPlaylistsTests(IPodTestCase):
+    def test_sync_refuses_while_playlist_tracks_are_loading(self):
+        from unittest import mock
+        app = self.bare_app(plex=object())
+        app._playlist_fetching = {"1"}
+        app._recompute_capacity = mock.Mock()
+        with mock.patch.object(self.p2i.app.messagebox, "showinfo") as shown:
+            app._on_sync()
+        shown.assert_called_once()
+        app._recompute_capacity.assert_not_called()
+        self.assertFalse(app._syncing)
+
+
 class _Var:
     """Minimal BooleanVar stand-in."""
 

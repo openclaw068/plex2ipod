@@ -1,6 +1,7 @@
 """Planning where each Plex track lands on the iPod, and writing playlists."""
 
 import os
+import posixpath
 
 from .naming import ipod_rel_path, sanitize_component
 from .platform_io import music_folder_name
@@ -68,3 +69,121 @@ class SyncEngine:
                 dur = t["duration_ms"] // 1000
                 label = f"{t['artist']} - {t['title']}" if t["artist"] else t["title"]
                 f.write(f"#EXTINF:{dur},{label}\n{self.m3u_path(t)}\n")
+
+
+# Anything Rockbox might play. A folder holding one of these is never
+# treated as clutter, whatever else is in it.
+AUDIO_EXTENSIONS = (".flac", ".mp3", ".m4a", ".m4b", ".aac", ".alac",
+                    ".ogg", ".oga", ".opus", ".wav", ".aif", ".aiff", ".ape",
+                    ".wv", ".mpc", ".wma", ".mka", ".dsf", ".dff")
+
+
+def find_clutter(music_root):
+    """Folders under music_root with no music in them at any depth.
+
+    Returns [(path, file count, bytes), ...] for the topmost such folders
+    only, so a release folder full of leftovers is one entry rather than
+    one per subfolder. A folder that could not be read counts as holding
+    music: what was not seen is never offered for deletion.
+    """
+    has_music = {}
+    totals = {}
+    for dirpath, dirnames, filenames in os.walk(music_root, topdown=False):
+        music = any(n.lower().endswith(AUDIO_EXTENSIONS) for n in filenames)
+        count, size = len(filenames), 0
+        for name in filenames:
+            try:
+                size += os.path.getsize(os.path.join(dirpath, name))
+            except OSError:
+                pass
+        for name in dirnames:
+            child = os.path.join(dirpath, name)
+            music = music or has_music.get(child, True)
+            sub_count, sub_size = totals.get(child, (0, 0))
+            count, size = count + sub_count, size + sub_size
+        has_music[dirpath] = music
+        totals[dirpath] = (count, size)
+    clutter = []
+    for path, music in has_music.items():
+        if music or path == music_root:
+            continue
+        parent = os.path.dirname(path)
+        if parent == music_root or has_music.get(parent, True):
+            clutter.append((path,) + totals[path])
+    return sorted(clutter)
+
+
+# Sidecars left by an interrupted download, copy or conversion. Never music.
+LEFTOVER_SUFFIXES = (".part", ".flac.tmp")
+
+
+def index_device(music_root):
+    """Walk the iPod's music folder once.
+
+    Returns (files, leftovers): files maps each non-empty file's lowercased
+    path relative to music_root (forward slashes) to (real path, size);
+    leftovers lists the real paths of interrupted-transfer sidecars.
+    """
+    files = {}
+    leftovers = []
+    for dirpath, _dirs, names in os.walk(music_root):
+        for name in names:
+            full = os.path.join(dirpath, name)
+            if name.lower().endswith(LEFTOVER_SUFFIXES):
+                leftovers.append(full)
+                continue
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                continue
+            if size <= 0:
+                continue
+            rel = os.path.relpath(full, music_root).replace(os.sep, "/")
+            files[rel.lower()] = (full, size)
+    return files, leftovers
+
+
+def group_by_name_and_size(sizes):
+    """{(lowercased basename, size): [rel, ...]} from {rel: size}."""
+    groups = {}
+    for rel, size in sizes.items():
+        groups.setdefault((posixpath.basename(rel), size), []).append(rel)
+    return groups
+
+
+def relocation_source(track, sizes, by_name_size, claimed):
+    """The lowercased path of a file already on the iPod that *is* this
+    track, sitting somewhere other than where the track belongs; or None.
+
+    Moving such a file into place is a rename on the device: no data
+    crosses USB. Two kinds of evidence count:
+
+    * The file's path is the tail of the track's path on the server, at
+      least folder/filename deep. Music copied to the iPod by hand keeps
+      the server's folder names, so this finds it even if it was later
+      converted and its size changed.
+    * It is the only file with the track's filename and exact size. Plex
+      renames (a corrected artist or album) move where the app expects a
+      track without changing the file itself.
+
+    `claimed` holds paths that must stay put: where other tracks belong.
+    """
+    candidates = []
+    parts = [p for p in (track.get("server_path") or "").lower().split("/")
+             if p]
+    for depth in range(len(parts), 1, -1):
+        candidates.append("/".join(parts[-depth:]))
+    try:
+        size = int(track.get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    name = (track.get("filename") or "").lower()
+    if size > 0 and name:
+        matches = [rel for rel in by_name_size.get((name, size), ())
+                   if rel not in claimed]
+        if len(matches) == 1:
+            candidates.append(matches[0])
+    for rel in candidates:
+        if rel in sizes and rel not in claimed:
+            return rel
+    return None

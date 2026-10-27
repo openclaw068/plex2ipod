@@ -1,9 +1,13 @@
-"""ffmpeg/ffprobe wrapper for FLAC downsampling.
+"""ffmpeg/ffprobe wrapper for making hi-res FLACs iPod-sized.
 
-Used by the sync-time checkbox and the Manage iPod "Downsample 24-bit
-Tracks" scan-and-replace feature. Converts 24-bit FLACs to 16-bit with
-triangular high-pass dither. Sample rate is preserved; tags are kept and
-embedded cover art is dropped.
+Used by the sync-time checkbox and the Manage iPod "Shrink Hi-Res"
+scan-and-replace feature. Converts anything above 16-bit to 16-bit with
+triangular high-pass dither, and anything above 48 kHz down to 48 or
+44.1 kHz. Tags are kept and embedded cover art is dropped.
+
+The iPod's audio hardware tops out at 48 kHz, so Rockbox resamples a
+96 kHz file on the fly anyway: storing it at 96 kHz costs twice the space,
+twice the USB transfer time and extra battery, for nothing audible.
 """
 
 import os
@@ -15,8 +19,45 @@ from .paths import resource_dirs
 from .platform_io import IS_WINDOWS
 
 
+# Highest sample rate worth storing on the iPod; see the module docstring.
+MAX_SAMPLE_RATE = 48000
+
+
+def ipod_sample_rate(rate):
+    """The rate to resample `rate` to for the iPod, or None to keep it.
+
+    Stays in the source's family, 44.1 kHz multiples to 44.1 and the rest
+    to 48, so the conversion is a clean 2:1 or 4:1.
+    """
+    if not rate or rate <= MAX_SAMPLE_RATE:
+        return None
+    return 44100 if rate % 44100 == 0 else 48000
+
+
+def needs_conversion(info):
+    """True if a probed FLAC is bigger than the iPod can make use of."""
+    info = info or {}
+    return ((info.get("bit_depth") or 16) > 16
+            or ipod_sample_rate(info.get("sample_rate")) is not None)
+
+
+def describe(info):
+    """'24-bit/96 kHz' style label for a probe result."""
+    info = info or {}
+    rate = info.get("sample_rate")
+    khz = f"{rate / 1000:g} kHz" if rate else "? kHz"
+    return f"{info.get('bit_depth') or 16}-bit/{khz}"
+
+
+def converted_info(info):
+    """What needs_conversion's conversion produces from `info`."""
+    info = info or {}
+    rate = info.get("sample_rate")
+    return {"bit_depth": 16, "sample_rate": ipod_sample_rate(rate) or rate}
+
+
 class AudioConverter:
-    """Wraps bundled ffmpeg/ffprobe for FLAC downsampling."""
+    """Wraps bundled ffmpeg/ffprobe for FLAC conversion."""
 
     def __init__(self):
         self.ffmpeg_path = self._locate("ffmpeg")
@@ -111,8 +152,9 @@ class AudioConverter:
         except (subprocess.TimeoutExpired, OSError):
             return None
 
-    def downsample(self, src, dst, timeout=300):
-        """Convert src -> dst as 16-bit FLAC. Sample rate is preserved.
+    def downsample(self, src, dst, timeout=600, sample_rate=None):
+        """Convert src -> dst as 16-bit FLAC, resampled to sample_rate when
+        one is given (see ipod_sample_rate), else at the source's rate.
         Tags are preserved; embedded cover art is dropped. Writes to dst
         atomically via a .tmp sidecar. Returns (True, None) on success,
         (False, err) on failure."""
@@ -132,8 +174,12 @@ class AudioConverter:
 
         # Use ffmpeg's native swr resampler (soxr isn't in every build).
         # triangular_hp dither is supported by swr and is ideal for 24->16.
-        # No osr= means sample rate is preserved.
+        # No osr= means sample rate is preserved. When resampling, a longer
+        # filter than swr's default keeps the passband flat to ~20 kHz.
         af = "aresample=dither_method=triangular_hp"
+        if sample_rate:
+            af = (f"aresample=osr={int(sample_rate)}:filter_size=64:"
+                  f"phase_shift=10:dither_method=triangular_hp")
         cmd = [
             self.ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
             "-i", src,

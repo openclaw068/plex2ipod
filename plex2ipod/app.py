@@ -1,7 +1,9 @@
 """The Tk application window and all of its behaviour."""
 
 import os
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -11,16 +13,19 @@ from tkinter import ttk, messagebox
 from urllib.error import HTTPError, URLError
 from xml.etree import ElementTree
 
-from .audio import AudioConverter
+from .audio import (AudioConverter, converted_info, describe,
+                    ipod_sample_rate, needs_conversion)
 from .config import CONFIG_DEFAULTS, ConfigManager
 from .naming import (find_path_collisions, ipod_rel_path,
                      sanitize_component, sort_key)
-from .paths import resource_dirs
+from .paths import resource_dirs, staging_root
 from .platform_io import (IS_WINDOWS, detect_ipod_roots, disk_usage,
                           eject_volume, list_ipod_roots, music_folder_name)
 from .plexapi import (PlexClient, plex_check_pin, plex_create_pin,
+                      plex_find_server,
                       plex_list_servers, plex_pick_connection)
-from .sync import SyncEngine
+from .sync import (SyncEngine, find_clutter, group_by_name_and_size,
+                   index_device, relocation_source)
 from .theme import THEMES
 from .version import APP_VERSION
 from .widgets import (CapacityBar, GlassCard, StyledButton,
@@ -66,7 +71,20 @@ class App:
         self._prechecked = False
         self._playlist_track_cache = {}
         self._playlist_fetching = set()
+        # Un-ticking a playlist un-ticks its tracks in the library too.
+        # _playlist_ticked tells a real un-tick from a var being rewritten
+        # as False; _playlist_pending_untick holds playlists whose tracks
+        # were still loading when un-ticked; _playlist_removed_paths stops
+        # a later library pre-check from ticking those tracks again.
+        self._playlist_ticked = set()
+        self._playlist_pending_untick = set()
+        self._playlist_removed_paths = set()
         self._ipod_index = None
+        # {rel: size} and {(name, size): [rel]} for the same files, so the
+        # capacity estimate can tell what a sync would move rather than
+        # download, and what its deletions would free.
+        self._ipod_sizes = {}
+        self._ipod_by_name_size = {}
         self._indexed_root = None
         self._capacity = None
         self._capacity_after = None
@@ -1002,10 +1020,10 @@ class App:
         self._rebuild_db_btn.pack(side="left", padx=(0, 6))
 
         self._downsample_existing_btn = StyledButton(
-            m_op_row, "\u21e9  Downsample 24-bit Tracks", self.t,
+            m_op_row, "\u21e9  Shrink Hi-Res", self.t,
             command=self._on_downsample_existing,
             bg=self.t["accent2"], hover_bg=self.t["border_light"],
-            fg=self.t["fg"], width=210, height=28, radius=6,
+            fg=self.t["fg"], width=130, height=28, radius=6,
             font=("Segoe UI", 9),
         )
         self._downsample_existing_btn.pack(side="left", padx=(0, 6))
@@ -1018,6 +1036,24 @@ class App:
             font=("Segoe UI", 9),
         )
         self._verify_repair_btn.pack(side="left", padx=(0, 6))
+
+        self._organize_btn = StyledButton(
+            m_op_row, "\u2630  Organize", self.t,
+            command=self._on_organize_ipod,
+            bg=self.t["accent2"], hover_bg=self.t["border_light"],
+            fg=self.t["fg"], width=110, height=28, radius=6,
+            font=("Segoe UI", 9),
+        )
+        self._organize_btn.pack(side="left", padx=(0, 6))
+
+        self._clean_up_btn = StyledButton(
+            m_op_row, "\u2702  Clean Up", self.t,
+            command=self._on_clean_up,
+            bg=self.t["accent2"], hover_bg=self.t["border_light"],
+            fg=self.t["fg"], width=100, height=28, radius=6,
+            font=("Segoe UI", 9),
+        )
+        self._clean_up_btn.pack(side="left", padx=(0, 6))
 
         # The status line gets its own row. Packed onto the button row it
         # was competing with six buttons for horizontal space and Tk
@@ -1144,7 +1180,7 @@ class App:
         self._downsample_var = tk.BooleanVar(value=initial)
         self._downsample_cb = StyledCheckbutton(
             btn_frame,
-            "Downsample 24-bit FLACs to 16-bit",
+            "Shrink hi-res FLACs (16-bit, \u226448 kHz)",
             self._downsample_var, self.t,
         )
         self._downsample_cb.pack(side="left", padx=(6, 0))
@@ -1597,13 +1633,41 @@ class App:
         threading.Thread(target=self._connect_worker, daemon=True).start()
 
     def _connect_worker(self):
+        url, token = self.cfg["plex_url"], self.cfg["plex_token"]
+        client = PlexClient(url, token)
+        if not client.ping():
+            # Most often the server got a new address from DHCP. plex.tv
+            # knows where it is now, so look it up instead of failing.
+            self.root.after(0, self._status_var.set,
+                            "Server not answering at the saved address "
+                            "\u2014 looking it up on plex.tv\u2026")
+            found = plex_find_server(self._client_id(), token, url)
+            if found and found[0] != url.rstrip("/"):
+                client = PlexClient(*found)
+                self.root.after(0, self._remember_server, *found)
         try:
-            self.plex = PlexClient(self.cfg["plex_url"], self.cfg["plex_token"])
+            self.plex = client
             playlists = self.plex.get_playlists()
             section_id = self.plex.get_music_section_id()
             self.root.after(0, self._on_connected, playlists, section_id)
-        except (URLError, HTTPError, ElementTree.ParseError, OSError) as e:
+        except HTTPError as e:
+            if e.code == 401:
+                msg = ("Plex rejected the saved sign-in. Click \u201cSign in "
+                       "to Plex\u201d to sign in again.")
+            else:
+                msg = f"Connection failed: {e}"
+            self.root.after(0, self._status_var.set, msg)
+        except (URLError, ElementTree.ParseError, OSError) as e:
             self.root.after(0, self._status_var.set, f"Connection failed: {e}")
+
+    def _remember_server(self, url, token):
+        """Keep a server address found by plex_find_server for next time."""
+        self._url_var.set(url)
+        self._token_var.set(token)
+        self.cfg["plex_url"] = url
+        self.cfg["plex_token"] = token
+        self.cfg_mgr.save(self.cfg)
+        self._log_msg(f"Plex server moved; now using {url}.")
 
     def _on_connected(self, playlists, section_id):
         self._section_id = section_id
@@ -1615,6 +1679,9 @@ class App:
         # first, so nothing below is undone by a later reset.
         self._playlist_track_cache.clear()
         self._playlist_fetching.clear()
+        self._playlist_ticked = set()
+        self._playlist_pending_untick = set()
+        self._playlist_removed_paths = set()
         self._artists_loaded = False
         for item in self._tree.get_children():
             self._tree.delete(item)
@@ -2427,27 +2494,93 @@ class App:
         """Download a track from Plex and place it at dest_path,
         downsampling to 16-bit if it's a >16-bit FLAC. Overwrites any
         existing file atomically. Returns (True, None) or (False, err)."""
+        staging = self._new_staging()
+        try:
+            ok, err, _note = self._fetch_track(
+                track, dest_path, self.audio.available, staging)
+            return ok, err
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    @staticmethod
+    def _new_staging():
+        """A fresh, empty scratch folder; see paths.staging_root.
+
+        Folders a crash left behind are cleared first. Only folders over an
+        hour old go, in case a second copy of the app is mid-transfer.
+        """
+        root = staging_root()
+        try:
+            os.makedirs(root, exist_ok=True)
+            cutoff = time.time() - 3600
+            for name in os.listdir(root):
+                path = os.path.join(root, name)
+                try:
+                    if os.path.getmtime(path) < cutoff:
+                        shutil.rmtree(path, ignore_errors=True)
+                except OSError:
+                    pass
+            return tempfile.mkdtemp(prefix="plex2ipod-", dir=root)
+        except OSError:
+            return tempfile.mkdtemp(prefix="plex2ipod-")
+
+    def _fetch_track(self, track, dest_path, downsample, staging):
+        """Download a track from Plex and place it at dest_path on the iPod.
+
+        Everything except the finished file happens on this computer: the
+        download lands in `staging`, a hi-res FLAC is converted there, and
+        only the result crosses USB, once. Doing the conversion on the iPod
+        instead would write the full-size file, read it back and write the
+        converted copy, all over the device's slow link. Both local files
+        are deleted before this returns, so at most one track's worth of
+        laptop storage is ever in use.
+
+        Returns (ok, error, note) where note describes the conversion
+        ("24-bit/96 kHz \u2192 16-bit/48 kHz") or is "" when the file was
+        copied as-is. error is "cancelled" when the user cancelled
+        mid-download.
+        """
+        local = os.path.join(staging, "download")
+        ok, tmp_or_err = self.plex.download_part(
+            track["part_key"], local, cancel_check=lambda: self._cancel,
+            expected_size=track.get("size") or 0)
+        if not ok:
+            return False, tmp_or_err, ""
+        source = tmp_or_err
+        converted = os.path.join(staging, "converted.flac")
+        try:
+            note = ""
+            if downsample and dest_path.lower().endswith(".flac"):
+                info = self.audio.probe(source) or {}
+                if needs_conversion(info):
+                    ok, err = self.audio.downsample(
+                        source, converted,
+                        sample_rate=ipod_sample_rate(info.get("sample_rate")))
+                    if not ok:
+                        return False, f"downsample failed: {err}", ""
+                    source = converted
+                    note = (f"{describe(info)} \u2192 "
+                            f"{describe(converted_info(info))}")
+            err = self._copy_to_ipod(source, dest_path)
+            return (False, err, "") if err else (True, None, note)
+        finally:
+            PlexClient._safe_remove(tmp_or_err)
+            PlexClient._safe_remove(converted)
+
+    @staticmethod
+    def _copy_to_ipod(src, dest_path):
+        """Copy a finished file onto the iPod through a .part sidecar, so an
+        interrupted copy never sits at the real path looking complete.
+        Returns an error string, or None."""
+        part = dest_path + ".part"
         try:
             os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            shutil.copyfile(src, part)
+            os.replace(part, dest_path)
+            return None
         except OSError as e:
-            return False, f"mkdir failed: {e}"
-        ok, tmp_or_err = self.plex.download_part(
-            track["part_key"], dest_path, cancel_check=lambda: self._cancel)
-        if not ok:
-            return False, tmp_or_err
-        tmp = tmp_or_err
-        if self.audio.available and dest_path.lower().endswith(".flac"):
-            info = self.audio.probe(tmp) or {}
-            if (info.get("bit_depth") or 16) > 16:
-                ok, err = self.audio.downsample(tmp, dest_path)
-                PlexClient._safe_remove(tmp)
-                return (True, None) if ok else (False, err)
-        try:
-            os.replace(tmp, dest_path)
-            return True, None
-        except OSError as e:
-            PlexClient._safe_remove(tmp)
-            return False, str(e)
+            PlexClient._safe_remove(part)
+            return str(e)
 
     def _sweep_orphans(self, music_root):
         """Remove leftover .part / .flac.tmp download sidecars from a
@@ -2490,6 +2623,7 @@ class App:
         self._busy = busy
         enabled = not busy
         for attr in ("_downsample_existing_btn", "_verify_repair_btn",
+                     "_organize_btn", "_clean_up_btn",
                      "_manage_remove_btn", "_manage_refresh_btn",
                      "_sync_btn"):
             btn = getattr(self, attr, None)
@@ -2498,35 +2632,35 @@ class App:
         if getattr(self, "_cancel_btn", None) is not None:
             self._cancel_btn.set_state(busy)
 
-    # ---- downsample existing 24-bit tracks on iPod ----
+    # ---- shrink hi-res tracks already on the iPod ----
 
     def _on_downsample_existing(self):
+        """Replace every FLAC on the iPod that is above 16-bit or 48 kHz
+        with an iPod-sized copy; see audio.needs_conversion."""
+        if self._syncing or self._busy:
+            messagebox.showwarning(
+                "Operation in progress",
+                "Wait for the current iPod operation to finish first.")
+            return
         if not self.audio.available:
             messagebox.showwarning(
                 "ffmpeg not available",
                 "ffmpeg was not found. This feature needs the bundled ffmpeg "
                 "binaries next to the app (or ffmpeg on your PATH).")
             return
-
         root = self._ipod_root()
         if not root or not os.path.isdir(root):
             messagebox.showwarning(
                 "iPod not found", f"iPod not accessible: {root or '(none)'}")
             return
-
-        if not self._require_plex():
-            return
-
         music_root = self._ipod_music_root()
         if not os.path.isdir(music_root):
             messagebox.showwarning(
                 "No music on iPod", f"{music_root} not found.")
             return
-
-        # Run scan + convert in a background thread
         self._cancel = False
         self._set_busy(True)
-        self._log_msg("Scanning iPod for 24-bit FLACs...")
+        self._log_msg("Scanning iPod for hi-res FLACs...")
         threading.Thread(
             target=self._downsample_existing_worker,
             args=(music_root,),
@@ -2535,19 +2669,21 @@ class App:
 
     def _downsample_existing_worker(self, music_root):
         try:
-            # First, sweep up any orphan .part / .flac.tmp files left behind
-            # by a previous failed run. These produce the "two copies,
-            # neither plays" symptom on the iPod.
             self._sweep_orphans(music_root)
+            # Plex is optional. A track it knows is fetched fresh, so only
+            # the small copy crosses USB; anything else is converted from
+            # the copy already on the iPod.
+            index = {}
+            if self.plex and self._section_id:
+                index, err = self._build_plex_index()
+                if err:
+                    self.root.after(
+                        0, self._log_msg,
+                        f"Could not index Plex ({err}); converting from the "
+                        f"copies on the iPod instead.")
+                    index = {}
 
-            index, err = self._build_plex_index()
-            if err:
-                self.root.after(0, self._log_msg, f"Could not index Plex: {err}")
-                self.root.after(0, lambda: messagebox.showerror(
-                    "Plex error", f"Could not read your Plex library:\n{err}"))
-                return
-
-            candidates = []  # (ipod_path, track, bd)
+            candidates = []  # (ipod_path, track or None, probe info)
             total_size = 0
             scanned = 0
             for root, _, files in os.walk(music_root):
@@ -2563,97 +2699,376 @@ class App:
                             f"Scanning... {scanned} files")
                     ipod_path = os.path.join(root, fname)
                     info = self.audio.probe(ipod_path)
-                    if not info:
-                        continue
-                    bd = info.get("bit_depth") or 16
-                    if bd <= 16:
+                    if not info or not needs_conversion(info):
                         continue
                     rel = os.path.relpath(ipod_path, music_root)
                     track = index.get(rel.replace("\\", "/").lower())
-                    if not track:
-                        self.root.after(
-                            0, self._log_msg,
-                            f"Skip (not found on Plex): {rel}")
-                        continue
                     try:
                         total_size += os.path.getsize(ipod_path)
                     except OSError:
                         pass
-                    candidates.append((ipod_path, track, bd))
-
+                    candidates.append((ipod_path, track, info))
             self.root.after(0, self._manage_status_var.set, "")
-
             if not candidates:
                 self.root.after(0, self._log_msg,
-                                f"Scan complete: no tracks need downsampling "
+                                f"Scan complete: nothing to shrink "
                                 f"({scanned} FLAC(s) checked).")
                 self.root.after(0, lambda: messagebox.showinfo(
                     "All clean",
                     f"Scanned {scanned} FLAC file(s) on the iPod.\n\n"
-                    "None are above 16-bit — nothing to do."))
+                    "None are above 16-bit or 48 kHz \u2014 nothing to do."))
                 return
 
+            from_plex = sum(1 for _p, t, _i in candidates if t)
             msg = (
-                f"Found {len(candidates)} FLAC file(s) above 16-bit "
-                f"on the iPod ({self._human_size(total_size)} total).\n\n"
-                "Each will be re-downloaded from Plex and replaced with a "
-                "fresh 16-bit version (dithered).\n\n"
+                f"Found {len(candidates)} hi-res FLAC file(s) on the iPod "
+                f"({self._human_size(total_size)} total).\n\n"
+                "Each will be replaced by a 16-bit copy at 44.1 or 48 kHz, "
+                "the most the iPod can play, typically a quarter to half "
+                "the size.\n\n"
+                f"{from_plex} will be fetched fresh from Plex and "
+                f"{len(candidates) - from_plex} converted from the copy on "
+                "the iPod. Conversion happens on this computer and each "
+                "temporary file is deleted as soon as it is on the iPod.\n\n"
                 "Music files on your Plex server will NOT be modified.\n\n"
                 "Continue?"
             )
-            if not self._ask_yes_no("Downsample 24-bit Tracks", msg):
-                self.root.after(0, self._log_msg, "Downsample cancelled.")
+            if not self._ask_yes_no("Shrink Hi-Res Tracks", msg):
+                self.root.after(0, self._log_msg, "Shrink cancelled.")
                 return
 
             total = len(candidates)
             done = 0
+            saved = 0
             errors = []
-            for i, (ipod_path, track, bd) in enumerate(candidates):
+            for i, (ipod_path, track, info) in enumerate(candidates):
                 if self._cancel:
                     self.root.after(0, self._log_msg, "Cancelled.")
                     break
                 rel = os.path.relpath(ipod_path, music_root)
                 self.root.after(
                     0, self._log_msg,
-                    f"Downsampling ({i+1}/{total}): {rel} [{bd}-bit → 16-bit]")
-                ok, err = self._redownload_track(track, ipod_path)
+                    f"Shrinking ({i+1}/{total}): {rel} [{describe(info)} "
+                    f"\u2192 {describe(converted_info(info))}]")
+                try:
+                    before = os.path.getsize(ipod_path)
+                except OSError:
+                    before = 0
+                if track:
+                    ok, err = self._redownload_track(track, ipod_path)
+                else:
+                    ok, err = self._shrink_on_device(ipod_path, info)
                 if ok:
                     done += 1
+                    try:
+                        saved += max(before - os.path.getsize(ipod_path), 0)
+                    except OSError:
+                        pass
                 else:
                     errors.append(f"{rel}: {err}")
                     self.root.after(0, self._log_msg, f"  Failed: {err}")
+                self.root.after(0, self._set_progress, (i + 1) / total * 100)
 
             self.root.after(
                 0, self._log_msg,
-                f"Downsample complete: {done}/{total} replaced, "
-                f"{len(errors)} error(s).")
+                f"Shrink complete: {done}/{total} replaced, "
+                f"{self._human_size(saved)} freed, {len(errors)} error(s).")
 
             def show_result():
                 if errors:
                     preview = "\n".join(errors[:5])
                     extra = f"\n...and {len(errors) - 5} more" if len(errors) > 5 else ""
                     messagebox.showwarning(
-                        "Downsample finished with errors",
-                        f"Replaced {done} of {total} files.\n\n"
+                        "Shrink finished with errors",
+                        f"Replaced {done} of {total} files and freed "
+                        f"{self._human_size(saved)}.\n\n"
                         f"Errors:\n{preview}{extra}")
                 else:
                     messagebox.showinfo(
-                        "Downsample complete",
-                        f"Replaced {done} file(s) on the iPod.\n\n"
+                        "Shrink complete",
+                        f"Replaced {done} file(s) on the iPod and freed "
+                        f"{self._human_size(saved)}.\n\n"
                         "Tip: click 'Rebuild Rockbox DB' so Rockbox re-scans "
                         "the updated files on next boot.")
             self.root.after(0, show_result)
 
         except Exception as e:
-            self.root.after(0, self._log_msg, f"Downsample error: {e}")
+            self.root.after(0, self._log_msg, f"Shrink error: {e}")
         finally:
             self.root.after(0, self._set_busy, False)
+            self.root.after(0, self._maybe_refresh_ipod_index, True)
+
+    def _shrink_on_device(self, ipod_path, info):
+        """Convert a FLAC that Plex cannot supply from the copy on the iPod.
+
+        Copied here, converted here, copied back: one read and one smaller
+        write over USB. A source that is cut short converts into an equally
+        short file, so the result is checked against the length the source
+        claims and the original is kept when they disagree; Verify & Repair
+        is the tool for those. Returns (True, None) or (False, err).
+        """
+        staging = self._new_staging()
+        try:
+            local = os.path.join(staging, "source.flac")
+            converted = os.path.join(staging, "converted.flac")
+            try:
+                shutil.copyfile(ipod_path, local)
+            except OSError as e:
+                return False, f"could not read from the iPod: {e}"
+            ok, err = self.audio.downsample(
+                local, converted,
+                sample_rate=ipod_sample_rate(info.get("sample_rate")))
+            if not ok:
+                return False, f"conversion failed: {err}"
+            claimed = self._header_duration(local)
+            got = self._probe_duration(converted)
+            if claimed and (not got or got < claimed - 2):
+                return False, ("the file on the iPod looks damaged (it is "
+                               "shorter than its header says); kept as is. "
+                               "Run Verify & Repair.")
+            err = self._copy_to_ipod(converted, ipod_path)
+            return (False, err) if err else (True, None)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def _header_duration(self, path):
+        """The length in seconds a file's header claims, or 0."""
+        try:
+            result = subprocess.run(
+                [self.audio.ffprobe_path, "-v", "error", "-show_entries",
+                 "format=duration", "-of", "default=nw=1:nk=1", path],
+                timeout=30, **AudioConverter._no_console_kwargs())
+            return float((result.stdout or "").strip() or 0)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            return 0
+
+    def _probe_duration(self, path):
+        """Seconds of audio actually decoded from `path`, or 0."""
+        try:
+            result = subprocess.run(
+                [self.audio.ffmpeg_path, "-nostdin", "-v", "quiet", "-i",
+                 path, "-map", "0:a:0", "-f", "null", "-progress", "pipe:1",
+                 "-nostats", "-"],
+                timeout=600, **AudioConverter._no_console_kwargs())
+        except (subprocess.TimeoutExpired, OSError):
+            return 0
+        decoded = 0
+        for line in (result.stdout or "").splitlines():
+            if line.startswith("out_time_us="):
+                try:
+                    decoded = int(line.split("=", 1)[1])
+                except ValueError:
+                    decoded = 0
+        return decoded / 1000000.0
+
+    # ---- organize: move hand-copied music into the standard layout ----
+
+    def _on_organize_ipod(self):
+        """Find music on the iPod that is a Plex track but sits outside the
+        Artist/Album/track layout (copied by hand, or left behind by a Plex
+        rename) and move it into place. Renames only: nothing is
+        downloaded or deleted."""
+        if self._syncing or self._busy:
+            messagebox.showwarning(
+                "Operation in progress",
+                "Wait for the current iPod operation to finish first.")
+            return
+        root = self._ipod_root()
+        if not root or not os.path.isdir(root):
+            messagebox.showwarning(
+                "iPod not found", f"iPod not accessible: {root or '(none)'}")
+            return
+        if not self.plex or not self._section_id:
+            messagebox.showwarning(
+                "Not connected",
+                "Connect to your Plex server first. Organizing matches the "
+                "files on the iPod against your Plex library.")
+            return
+        music_root = self._ipod_music_root()
+        if not os.path.isdir(music_root):
+            messagebox.showwarning("No music on iPod", f"{music_root} not found.")
+            return
+        self._cancel = False
+        self._set_busy(True)
+        self._log_msg("Organize: reading the iPod and your Plex library...")
+        threading.Thread(target=self._organize_worker,
+                         args=(root, music_root), daemon=True).start()
+
+    def _organize_plan(self, library, files):
+        """[(track, source rel), ...]: files to move so each lands where
+        sync expects that track. library: {app rel: track} for the whole
+        Plex library. files: index_device output."""
+        sizes = {rel: size for rel, (_full, size) in files.items()}
+        by_name_size = group_by_name_and_size(sizes)
+        # Anything already where some Plex track belongs stays put.
+        claimed = {rel for rel in library if rel in files}
+        plan = []
+        for rel, track in library.items():
+            if rel in files:
+                continue
+            source = relocation_source(track, sizes, by_name_size, claimed)
+            if source:
+                claimed.add(source)
+                plan.append((track, source))
+        return plan
+
+    def _organize_worker(self, root, music_root):
+        moved = 0
+        try:
+            files, _leftovers = index_device(music_root)
+            library, err = self._build_plex_index()
+            if err:
+                self.root.after(0, self._log_msg, f"Could not index Plex: {err}")
+                return
+            engine = SyncEngine(root)
+            plan = self._organize_plan(library, files)
+            audio = [rel for rel in files
+                     if rel.endswith((".flac", ".mp3", ".m4a", ".ogg",
+                                      ".opus", ".wav", ".aac"))]
+            in_place = sum(1 for rel in audio if rel in library)
+            unmatched = len(audio) - in_place - len(plan)
+            self.root.after(
+                0, self._log_msg,
+                f"Organize: {in_place} track(s) already in place, "
+                f"{len(plan)} to move, {unmatched} not found in Plex.")
+            if not plan:
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Organize iPod",
+                    "Everything on the iPod that matches your Plex library "
+                    "is already in its Artist/Album folder."))
+                return
+
+            preview = "\n".join(
+                f"  {files[src][0][len(music_root) + 1:]}"
+                for _t, src in plan[:5])
+            more = f"\n  ...and {len(plan) - 5} more" if len(plan) > 5 else ""
+            if not self._ask_yes_no(
+                    "Organize iPod",
+                    f"{len(plan)} track(s) on the iPod match your Plex "
+                    f"library but sit outside the Artist/Album layout:\n\n"
+                    f"{preview}{more}\n\n"
+                    "They will be moved into place. This is a rename on the "
+                    "device: nothing is downloaded or deleted, and playlists "
+                    "are updated to the new paths. Afterwards they show up "
+                    "ticked, and sync will never download them again.\n\n"
+                    f"{unmatched} file(s) that match nothing in Plex stay "
+                    "where they are.\n\nContinue?"):
+                self.root.after(0, self._log_msg, "Organize cancelled.")
+                return
+
+            renames = {}
+            for track, src in plan:
+                if self._cancel:
+                    self.root.after(0, self._log_msg, "Organize cancelled.")
+                    break
+                full = files[src][0]
+                dst = engine.dest_path(track)
+                try:
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    os.replace(full, dst)
+                except OSError as e:
+                    self.root.after(0, self._log_msg,
+                                    f"  Could not move {src}: {e}")
+                    continue
+                renames[full] = dst
+                moved += 1
+            updated = self._rewrite_m3u_paths(renames)
+            emptied = self._cleanup_empty_dirs(music_root)
+            self.root.after(
+                0, self._log_msg,
+                f"Organize complete: {moved} track(s) moved, {updated} "
+                f"playlist file(s) updated, {emptied} empty folder(s) "
+                f"removed. Folders still holding non-music files (.nfo, "
+                f"artwork...) were left in place; Clean Up removes them.")
+        except Exception as e:
+            self.root.after(0, self._log_msg, f"Organize error: {e}")
+        finally:
+            self.root.after(0, self._organize_finished, moved)
+
+    def _organize_finished(self, moved):
+        self._set_busy(False)
+        if moved:
+            # Reconnecting re-runs the pre-check against the new layout, so
+            # what was just moved shows up ticked.
+            self._log_msg("Reconnecting to refresh the selection...")
+            self._on_connect()
+
+    # ---- clean up: folders with no music left in them ----
+
+    def _on_clean_up(self):
+        """Delete folders under Music that hold no music at any depth:
+        what Organize leaves behind (.nfo, .sfv, logs, artwork) and
+        download-tool folders. Asks first, listing what will go."""
+        if self._syncing or self._busy:
+            messagebox.showwarning(
+                "Operation in progress",
+                "Wait for the current iPod operation to finish first.")
+            return
+        root = self._ipod_root()
+        if not root or not os.path.isdir(root):
+            messagebox.showwarning(
+                "iPod not found", f"iPod not accessible: {root or '(none)'}")
+            return
+        music_root = self._ipod_music_root()
+        if not os.path.isdir(music_root):
+            messagebox.showwarning("No music on iPod", f"{music_root} not found.")
+            return
+        self._cancel = False
+        self._set_busy(True)
+        self._log_msg("Clean Up: looking for folders with no music in them...")
+        threading.Thread(target=self._clean_up_worker, args=(music_root,),
+                         daemon=True).start()
+
+    def _clean_up_worker(self, music_root):
+        try:
+            clutter = find_clutter(music_root)
+            if not clutter:
+                self.root.after(0, self._log_msg,
+                                "Clean Up: every folder holds music.")
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Clean Up", "Nothing to clean up: every folder under "
+                    "Music holds music."))
+                return
+            files = sum(count for _p, count, _s in clutter)
+            size = sum(size for _p, _c, size in clutter)
+            preview = "\n".join(
+                f"  {os.path.relpath(path, music_root)}  ({count} file(s))"
+                for path, count, _s in clutter[:6])
+            more = (f"\n  ...and {len(clutter) - 6} more"
+                    if len(clutter) > 6 else "")
+            if not self._ask_yes_no(
+                    "Clean Up",
+                    f"{len(clutter)} folder(s) under Music contain no music, "
+                    f"only leftovers such as .nfo, .sfv, .log, artwork and "
+                    f"download-tool files:\n\n{preview}{more}\n\n"
+                    f"Delete them ({files} file(s), "
+                    f"{self._human_size(size)})? Folders that hold any music "
+                    f"are never touched.\n\nThis cannot be undone."):
+                self.root.after(0, self._log_msg, "Clean Up cancelled.")
+                return
+            removed = 0
+            for path, _count, _size in clutter:
+                if self._cancel:
+                    break
+                shutil.rmtree(path, ignore_errors=True)
+                if not os.path.exists(path):
+                    removed += 1
+            self._cleanup_empty_dirs(music_root)
+            self.root.after(
+                0, self._log_msg,
+                f"Clean Up complete: removed {removed} folder(s), "
+                f"{self._human_size(size)} freed.")
+        except Exception as e:
+            self.root.after(0, self._log_msg, f"Clean Up error: {e}")
+        finally:
+            self.root.after(0, self._set_busy, False)
+            self.root.after(0, self._maybe_refresh_ipod_index, True)
 
     # ---- verify & repair ----
 
     def _on_verify_repair(self):
         """Walk every FLAC on the iPod, identify broken/orphan files, and
-        re-download them fresh from Plex (downsampled if 24-bit).
+        re-download them fresh from Plex (shrunk if hi-res).
         Designed to recover from a previous bad downsample run."""
         if not self.audio.available:
             messagebox.showwarning(
@@ -2680,7 +3095,7 @@ class App:
             "Verify & Repair",
             "This will scan every FLAC on the iPod, identify broken or "
             "unplayable files, and re-download them fresh from your Plex "
-            "library (downsampled if 24-bit).\n\n"
+            "library (shrunk to 16-bit/48 kHz if hi-res).\n\n"
             "Use this to recover from a previously botched downsample run.\n\n"
             "Music files on your Plex server will NOT be modified.\n\n"
             "This may take a while for large libraries. Continue?",
@@ -2726,9 +3141,10 @@ class App:
                             0, self._manage_status_var.set,
                             f"Scanning... {scanned} files")
                     ipod_path = os.path.join(root, fname)
-                    if self._is_flac_broken(ipod_path):
-                        rel = os.path.relpath(ipod_path, music_root)
-                        track = index.get(rel.replace("\\", "/").lower())
+                    rel = os.path.relpath(ipod_path, music_root)
+                    track = index.get(rel.replace("\\", "/").lower())
+                    expected_ms = (track or {}).get("duration_ms") or 0
+                    if self._is_flac_broken(ipod_path, expected_ms):
                         if track:
                             broken.append((ipod_path, track))
                         else:
@@ -2753,7 +3169,7 @@ class App:
             if broken:
                 msg_parts.append(
                     f"\n{len(broken)} broken file(s) will be re-downloaded "
-                    f"from Plex (downsampled if 24-bit).")
+                    f"from Plex (shrunk if hi-res).")
             if unplayable:
                 msg_parts.append(
                     f"\n{len(unplayable)} broken file(s) have NO match "
@@ -2828,13 +3244,20 @@ class App:
         finally:
             self.root.after(0, self._set_busy, False)
 
-    def _is_flac_broken(self, path):
+    def _is_flac_broken(self, path, expected_ms=0):
         """Return True if the file fails basic playability checks.
         A FLAC is considered broken if:
           - it doesn't exist
           - it's smaller than 2 KB (truncated / empty)
           - ffprobe can't read its bit depth or sample rate
           - ffprobe reports zero duration
+          - it is more than 2 s shorter than Plex says (expected_ms)
+          - its last seconds do not decode
+
+        The duration ffprobe reports comes from the FLAC header, which
+        survives truncation intact: a file missing most of its audio still
+        claims its full length. Decoding the tail is what catches that,
+        and it reads only the end of the file, so it is cheap over USB.
         """
         try:
             if not os.path.isfile(path):
@@ -2864,6 +3287,7 @@ class App:
 
         has_sr = False
         has_dur = False
+        duration = 0.0
         for line in (result.stdout or "").splitlines():
             line = line.strip()
             if "=" not in line:
@@ -2880,12 +3304,59 @@ class App:
                     pass
             elif k == "duration":
                 try:
-                    if float(v) > 0.5:   # at least half a second
+                    duration = float(v)
+                    if duration > 0.5:   # at least half a second
                         has_dur = True
                 except ValueError:
                     pass
 
-        return not (has_sr and has_dur)
+        if not (has_sr and has_dur):
+            return True
+        if expected_ms and duration < expected_ms / 1000.0 - 2:
+            return True
+        return not self._tail_decodes(path, duration)
+
+    def _tail_decodes(self, path, duration):
+        """True if the end the header promises is really there.
+
+        Decodes the last 10 s (half the track, if shorter) and checks that
+        all but a second of it comes out. Judged by how much audio comes
+        out, not by ffmpeg's complaints: an ID3v1 tag that some taggers
+        append after the FLAC data draws a decode error on the file's last
+        "frame" although every sample is intact.
+
+        Seeking that close to the end can land past the last frame of a
+        file without a seek table and decode nothing, so a miss is retried
+        from further back before the file is called broken.
+        """
+        for seconds in (10, 30):
+            seconds = min(seconds, duration / 2)
+            decoded = self._decode_tail(path, seconds)
+            if decoded:
+                return decoded >= seconds - 1
+        return False
+
+    def _decode_tail(self, path, seconds):
+        """Seconds of audio decoded from `seconds` before the end; 0 when
+        nothing decodes."""
+        try:
+            result = subprocess.run(
+                [self.audio.ffmpeg_path, "-nostdin", "-v", "quiet",
+                 "-sseof", f"-{seconds:.3f}", "-i", path, "-map", "0:a:0",
+                 "-f", "null", "-progress", "pipe:1", "-nostats", "-"],
+                timeout=60,
+                **AudioConverter._no_console_kwargs(),
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return 0
+        decoded_us = 0
+        for line in (result.stdout or "").splitlines():
+            if line.startswith("out_time_us="):
+                try:
+                    decoded_us = int(line.split("=", 1)[1])
+                except ValueError:      # "N/A": nothing decoded
+                    decoded_us = 0
+        return decoded_us / 1000000.0
 
     # ---- reflecting what is already on the iPod ----
 
@@ -2972,10 +3443,12 @@ class App:
                 continue
             rel = ipod_rel_path(info["data"]).lower()
             if rel in self._ipod_index:
+                self._baseline_paths.add(rel)
+                if rel in self._playlist_removed_paths:
+                    continue
                 self._tree_checked[child] = True
                 self._tree_partial.discard(child)
                 self._set_row_mark(child, True)
-                self._baseline_paths.add(rel)
                 ticked += 1
         if ticked:
             self._refresh_ancestor_marks(
@@ -3019,14 +3492,18 @@ class App:
         except (tk.TclError, AttributeError):
             self._capacity_after = None
 
-    def _track_bytes(self, track, seen):
-        """Bytes this track would add, or 0 if it is a duplicate or is
-        already on the device."""
+    def _track_bytes(self, track, seen, claimed=frozenset()):
+        """Bytes this track would add, or 0 if it is a duplicate, is
+        already on the device, or is on the device elsewhere and would be
+        moved into place rather than downloaded."""
         rel = ipod_rel_path(track).lower()
         if rel in seen:
             return 0
         seen.add(rel)
         if self._ipod_index is not None and rel in self._ipod_index:
+            return 0
+        if self._ipod_sizes and relocation_source(
+                track, self._ipod_sizes, self._ipod_by_name_size, claimed):
             return 0
         try:
             return max(int(track.get("size") or 0), 0)
@@ -3036,13 +3513,15 @@ class App:
     def _selection_bytes(self):
         """(bytes the selection would add, whether any size is still unknown).
 
-        Sizes come from Plex, so a 24-bit FLAC queued for downsampling is
+        Sizes come from Plex, so a hi-res FLAC that sync will shrink is
         counted at its source size. That overestimates, which is the safe
         direction for a capacity warning.
         """
         seen = set()
         total = 0
         pending = False
+        # Files where selected tracks belong are never moved away.
+        claimed = self._selected_paths() if self._ipod_sizes else frozenset()
         for pid, (var, _pl) in self._playlist_vars.items():
             if not var.get():
                 continue
@@ -3051,10 +3530,23 @@ class App:
                 pending = True
                 continue
             for track in tracks:
-                total += self._track_bytes(track, seen)
+                total += self._track_bytes(track, seen, claimed)
         for track in self._gather_library_tracks():
-            total += self._track_bytes(track, seen)
+            total += self._track_bytes(track, seen, claimed)
         return total, pending
+
+    def _freed_bytes(self):
+        """Space the pending deletions will give back. Sync removes them
+        before downloading, so it counts toward what the selection may
+        use."""
+        if not self._ipod_sizes:
+            return 0
+        music_root = self._ipod_music_root()
+        freed = 0
+        for path in self._pending_deletions()[0]:
+            rel = os.path.relpath(path, music_root).replace(os.sep, "/")
+            freed += self._ipod_sizes.get(rel.lower(), 0)
+        return freed
 
     def _recompute_capacity(self):
         self._capacity_after = None
@@ -3070,14 +3562,18 @@ class App:
 
         total, used, free = usage
         selected, pending = self._selection_bytes()
-        over = max(selected - free, 0)
+        freed = self._freed_bytes()
+        over = max(selected - free - freed, 0)
         self._capacity = {"total": total, "used": used, "free": free,
-                          "selected": selected, "over": over}
-        self._capacity_bar.set_values(total, used, selected)
+                          "selected": selected, "freed": freed, "over": over}
+        # The bar shows the device as it will be: removals come off "used".
+        self._capacity_bar.set_values(total, max(used - freed, 0), selected)
 
         text = (f"{self._human_size(used)} used  \u2022  "
-                f"{self._human_size(selected)} selected  \u2022  "
-                f"{self._human_size(free)} free of {self._human_size(total)}")
+                f"{self._human_size(selected)} selected  \u2022  ")
+        if freed:
+            text += f"{self._human_size(freed)} to remove  \u2022  "
+        text += f"{self._human_size(free)} free of {self._human_size(total)}"
         if pending:
             text += "  \u2022  sizing playlists\u2026"
         if over:
@@ -3096,6 +3592,7 @@ class App:
         if not root or not os.path.isdir(root):
             if self._ipod_index is not None or self._indexed_root:
                 self._ipod_index = None
+                self._set_ipod_sizes({})
                 self._indexed_root = None
                 self._schedule_capacity_update()
             return
@@ -3120,21 +3617,20 @@ class App:
         case-sensitive filesystem the lowercased form names nothing, so
         the real path has to be carried alongside.
         """
-        index = {}
         try:
-            for dirpath, _dirs, files in os.walk(music_root):
-                for name in files:
-                    full = os.path.join(dirpath, name)
-                    try:
-                        if os.path.getsize(full) <= 0:
-                            continue
-                    except OSError:
-                        continue
-                    rel = os.path.relpath(full, music_root)
-                    index[rel.replace(os.sep, "/").lower()] = full
+            files, _leftovers = index_device(music_root)
         except OSError:
-            pass
+            files = {}
+        index = {rel: full for rel, (full, _size) in files.items()}
+        sizes = {rel: size for rel, (_full, size) in files.items()}
+        # Scheduled first: after() callbacks run in order, so the sizes are
+        # in place by the time the index triggers a capacity update.
+        self.root.after(0, self._set_ipod_sizes, sizes)
         self.root.after(0, self._set_ipod_index, index)
+
+    def _set_ipod_sizes(self, sizes):
+        self._ipod_sizes = sizes
+        self._ipod_by_name_size = group_by_name_and_size(sizes)
 
     def _set_ipod_index(self, index):
         self._ipod_index = index
@@ -3145,9 +3641,53 @@ class App:
 
     def _on_playlist_toggled(self, playlist_id):
         var = self._playlist_vars.get(playlist_id, (None, None))[0]
-        if var is not None and var.get():
+        if var is None:
+            return
+        if var.get():
+            self._playlist_ticked.add(playlist_id)
+            self._playlist_pending_untick.discard(playlist_id)
             self._ensure_playlist_tracks(playlist_id)
+        elif playlist_id in self._playlist_ticked:
+            self._playlist_ticked.discard(playlist_id)
+            if playlist_id in self._playlist_track_cache:
+                self._cascade_playlist_untick(playlist_id)
+            else:
+                self._playlist_pending_untick.add(playlist_id)
+                self._ensure_playlist_tracks(playlist_id)
         self._schedule_capacity_update()
+
+    def _cascade_playlist_untick(self, playlist_id):
+        """Un-tick a just-un-ticked playlist's tracks in the library tab.
+
+        Tracks another ticked playlist still uses are left alone. What is
+        un-ticked here becomes a deletion through the usual baseline rule,
+        and the user can re-tick any of it in the library to keep it.
+        """
+        keep = set()
+        for pid, (var, _pl) in self._playlist_vars.items():
+            if pid != playlist_id and var.get():
+                for track in self._playlist_track_cache.get(pid) or ():
+                    keep.add(ipod_rel_path(track).lower())
+        removed = {ipod_rel_path(track).lower()
+                   for track in self._playlist_track_cache.get(playlist_id)
+                   or ()} - keep
+        if not removed:
+            return
+        self._playlist_removed_paths |= removed
+
+        unticked = 0
+        for iid, info in list(self._tree_data.items()):
+            if (info["type"] != "track" or not self._tree_checked.get(iid)
+                    or ipod_rel_path(info["data"]).lower() not in removed):
+                continue
+            self._set_checked(iid, False)
+            self._refresh_ancestor_marks(iid)
+            unticked += 1
+        if unticked:
+            title = self._playlist_vars[playlist_id][1]["title"]
+            self._log_msg(
+                f"Un-ticked {unticked} track(s) from \u201c{title}\u201d "
+                f"in the Library tab. Re-tick any you want to keep.")
 
     def _ensure_playlist_tracks(self, playlist_id):
         """Fetch a playlist's tracks in the background purely to size it.
@@ -3175,6 +3715,11 @@ class App:
     def _store_playlist_tracks(self, playlist_id, tracks):
         self._playlist_fetching.discard(playlist_id)
         self._playlist_track_cache[playlist_id] = tracks
+        if playlist_id in self._playlist_pending_untick:
+            self._playlist_pending_untick.discard(playlist_id)
+            var = self._playlist_vars.get(playlist_id, (None, None))[0]
+            if var is not None and not var.get():
+                self._cascade_playlist_untick(playlist_id)
         self._schedule_capacity_update()
 
     # ---- sync ----
@@ -3195,15 +3740,20 @@ class App:
         """(track file paths, playlist file paths) the user has un-ticked.
 
         Only ever drawn from the baseline — the things this session ticked
-        for the user because they were already on the device. Anything the
-        app never ticked is never a deletion candidate, so an artist whose
-        load failed, or music the Plex library does not know about, cannot
-        be removed by a sync.
+        for the user because they were already on the device, which
+        includes the tracks of a playlist pre-checked because its .m3u was
+        there. Anything the app never ticked is never a deletion
+        candidate, so an artist whose load failed, or music the Plex
+        library does not know about, cannot be removed by a sync.
         """
         selected = self._selected_paths()
         index = self._ipod_index or {}
+        candidates = set(self._baseline_paths)
+        for pid in self._baseline_playlists:
+            for track in self._playlist_track_cache.get(pid) or ():
+                candidates.add(ipod_rel_path(track).lower())
         tracks = []
-        for rel in sorted(self._baseline_paths - selected):
+        for rel in sorted(candidates - selected):
             actual = index.get(rel)
             if actual:
                 tracks.append(actual)
@@ -3256,7 +3806,8 @@ class App:
             f"{self._human_size(capacity['over'])} more than the iPod has "
             f"free.\n\n"
             f"Selected:  {self._human_size(capacity['selected'])}\n"
-            f"Free:      {self._human_size(capacity['free'])}\n\n"
+            f"Free:      {self._human_size(capacity['free'])}\n"
+            f"Removing:  {self._human_size(capacity.get('freed', 0))}\n\n"
             "Transfer until the iPod is full?\n\n"
             "Tracks are copied in order and the sync stops cleanly when the "
             "device fills up. Playlists will list only the tracks that "
@@ -3285,6 +3836,15 @@ class App:
         if not root or not os.path.isdir(root):
             messagebox.showwarning(
                 "iPod not found", f"iPod not accessible: {root or '(none)'}")
+            return
+
+        # A ticked playlist whose tracks have not arrived would look like it
+        # selects nothing, and its songs could be queued for deletion.
+        if self._playlist_fetching or self._playlist_pending_untick:
+            messagebox.showinfo(
+                "Still loading",
+                "Still reading playlist contents from Plex. Try Sync again "
+                "in a moment.")
             return
 
         # The capacity figures are updated on a short debounce, so bring
@@ -3450,12 +4010,32 @@ class App:
         self._warn_about_collisions(selected)
 
         unique_tracks = list(all_tracks.values())
+        files, leftovers = index_device(self.sync_engine.ipod_music_dir())
+        for path in leftovers:
+            PlexClient._safe_remove(path)
+        if leftovers:
+            self.root.after(
+                0, self._log_msg,
+                f"Removed {len(leftovers)} leftover temp file(s) from an "
+                f"interrupted transfer.")
         to_copy, already_exist = self.sync_engine.build_sync_plan(unique_tracks)
 
+        # A track missing from its own path may still be on the iPod under
+        # another one. Moving it is a rename; downloading it again would
+        # cost the whole file over USB.
+        moved = self._relocate_tracks(to_copy, files, set(all_tracks))
+        if moved:
+            moved_keys = {key(t) for t in moved}
+            to_copy = [t for t in to_copy if key(t) not in moved_keys]
+            already_exist = already_exist + moved
+
+        moved_note = (f" ({len(moved)} moved into place, no transfer)"
+                      if moved else "")
         self.root.after(
             0, self._log_msg,
             f"Found {len(unique_tracks)} tracks. "
-            f"{len(to_copy)} to download, {len(already_exist)} already on iPod.",
+            f"{len(to_copy)} to download, {len(already_exist)} already on "
+            f"iPod{moved_note}.",
         )
 
         # Keys of tracks that are actually on the iPod. Seeded with the
@@ -3464,11 +4044,19 @@ class App:
         # cancelled track never gets an entry pointing at a missing file.
         on_ipod = {key(t) for t in already_exist}
 
+        # Remove what was un-ticked before downloading, so the space it
+        # frees is there for the new tracks. Run the other way round, a
+        # swap on a nearly full iPod stops part-way and needs a second sync.
+        removed = self._apply_deletions(deletions)
+
         total = len(to_copy)
         copied = 0
         converted = 0
         failed = 0
         filled = False
+        # Downloads and conversions happen here, on this computer; see
+        # _fetch_track. Emptied after every track, removed after the loop.
+        staging = self._new_staging()
         for i, t in enumerate(to_copy):
             if self._cancel:
                 self.root.after(0, self._log_msg, "Sync cancelled by user.")
@@ -3476,10 +4064,11 @@ class App:
             rel = ipod_rel_path(t)
             dst = self.sync_engine.dest_path(t)
 
-            # Stop before writing rather than failing every remaining
-            # track with a disk-full error. The download needs room for a
-            # .part sidecar plus the final file, and FAT32 needs room for
-            # directory entries, hence the margin.
+            # Stop before downloading rather than failing every remaining
+            # track with a disk-full error. The Plex size is the source
+            # file's, so a track that will be downsampled is over-counted,
+            # which errs on the safe side; FAT32 needs room for directory
+            # entries too, hence the margin.
             need = 0
             try:
                 need = max(int(t.get("size") or 0), 0)
@@ -3494,63 +4083,25 @@ class App:
                     f"were not copied.")
                 break
 
-            try:
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-            except OSError as e:
-                failed += 1
-                self.root.after(0, self._log_msg, f"  Failed (mkdir): {rel}: {e}")
-                continue
-
-            # Download the media straight from Plex to a .part sidecar.
             self.root.after(0, self._log_msg,
                             f"Downloading ({i+1}/{total}): {rel}")
-            ok, tmp_or_err = self.plex.download_part(
-                t["part_key"], dst, cancel_check=lambda: self._cancel)
-            if not ok:
-                if tmp_or_err == "cancelled":
-                    self.root.after(0, self._log_msg, "Sync cancelled by user.")
-                    break
+            ok, err, note = self._fetch_track(t, dst, downsample, staging)
+            if ok:
+                copied += 1
+                on_ipod.add(key(t))
+                if note:
+                    converted += 1
+                    self.root.after(0, self._log_msg, f"  Converted: {note}")
+            elif err == "cancelled":
+                self.root.after(0, self._log_msg, "Sync cancelled by user.")
+                break
+            else:
                 failed += 1
-                self.root.after(0, self._log_msg,
-                                f"  Download failed: {rel}: {tmp_or_err}")
-                continue
-            tmp = tmp_or_err
-
-            # Decide: downsample (24-bit FLAC) or place as-is.
-            placed = False
-            if downsample and dst.lower().endswith(".flac"):
-                info = self.audio.probe(tmp) or {}
-                bd = info.get("bit_depth") or 16
-                if bd > 16:
-                    self.root.after(
-                        0, self._log_msg,
-                        f"  Downsampling: {bd}-bit → 16-bit")
-                    ok, err = self.audio.downsample(tmp, dst)
-                    PlexClient._safe_remove(tmp)
-                    if ok:
-                        copied += 1
-                        converted += 1
-                        on_ipod.add(key(t))
-                        placed = True
-                    else:
-                        failed += 1
-                        self.root.after(0, self._log_msg,
-                                        f"  Downsample failed: {err}")
-                        placed = True  # tmp already cleaned; nothing on disk
-
-            if not placed:
-                # Atomically move the finished download into place.
-                try:
-                    os.replace(tmp, dst)
-                    copied += 1
-                    on_ipod.add(key(t))
-                except OSError as e:
-                    PlexClient._safe_remove(tmp)
-                    failed += 1
-                    self.root.after(0, self._log_msg,
-                                    f"  Place failed: {rel}: {e}")
+                self.root.after(0, self._log_msg, f"  Failed: {rel}: {err}")
 
             self.root.after(0, self._set_progress, (i + 1) / total * 100)
+
+        shutil.rmtree(staging, ignore_errors=True)
 
         # Write playlists. generate_m3u rewrites each file from scratch, so
         # every entry must point at a track that is really on the device —
@@ -3579,17 +4130,16 @@ class App:
             except OSError as e:
                 self.root.after(0, self._log_msg, f"Error writing {name}.m3u: {e}")
 
-        removed = self._apply_deletions(deletions)
-
-        skipped = len(already_exist)
-        conv_suffix = f" ({converted} downsampled)" if converted else ""
+        skipped = len(already_exist) - len(moved)
+        conv_suffix = f" ({converted} converted)" if converted else ""
+        move_suffix = f", {len(moved)} moved" if moved else ""
         fail_suffix = f", {failed} failed" if failed else ""
         full_suffix = " \u2014 iPod filled up" if filled else ""
         del_suffix = f", {removed} removed" if removed else ""
         self.root.after(
             0, self._log_msg,
-            f"Done. {copied} downloaded{conv_suffix}, {skipped} skipped"
-            f"{fail_suffix}{del_suffix}, {written} playlist(s) "
+            f"Done. {copied} downloaded{conv_suffix}{move_suffix}, "
+            f"{skipped} skipped{fail_suffix}{del_suffix}, {written} playlist(s) "
             f"written{full_suffix}.",
         )
         if filled:
@@ -3601,11 +4151,109 @@ class App:
                 "Free some space from the Manage iPod tab, then sync again "
                 "to continue."))
 
-    def _apply_deletions(self, deletions):
-        """Remove what the user un-ticked, after the additions have landed.
+    def _relocate_tracks(self, tracks, files, claimed):
+        """Move files already on the iPod into place for tracks that would
+        otherwise be downloaded; see relocation_source for what counts as a
+        match. Playlists that pointed at the old paths are updated.
 
-        Deletions run last so that a track which moved between albums is
-        written to its new home before the old copy goes.
+        files: index_device output. claimed: lowercased paths that belong
+        to selected tracks and so must never be moved away.
+        Returns the tracks that were moved.
+        """
+        if not tracks or not files:
+            return []
+        sizes = {rel: size for rel, (_full, size) in files.items()}
+        by_name_size = group_by_name_and_size(sizes)
+        claimed = set(claimed)
+        moved = []
+        renames = {}
+        for t in tracks:
+            if self._cancel:
+                break
+            rel = relocation_source(t, sizes, by_name_size, claimed)
+            if rel is None:
+                continue
+            src = files[rel][0]
+            dst = self.sync_engine.dest_path(t)
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                os.replace(src, dst)
+            except OSError as e:
+                self.root.after(0, self._log_msg,
+                                f"  Could not move {rel}: {e}")
+                continue
+            claimed.add(rel)
+            moved.append(t)
+            renames[src] = dst
+            self.root.after(0, self._log_msg,
+                            f"  Moved into place: {ipod_rel_path(t)}")
+        if renames:
+            self._rewrite_m3u_paths(renames)
+            self._cleanup_empty_dirs(self.sync_engine.ipod_music_dir())
+        return moved
+
+    def _rewrite_m3u_paths(self, renames):
+        """Point playlist entries at files that were moved on the iPod.
+
+        renames maps old real paths to new ones. Both .m3u and .m3u8 are
+        covered, and any prefix before the music folder is kept, so the
+        app's "/Music/..." entries and Rockbox's own "/<HDD0>/Music/..."
+        ones are both followed. Returns how many playlist files changed.
+        """
+        root = self._ipod_root()
+        playlist_dir = os.path.join(root, "Playlists")
+        if not renames or not os.path.isdir(playlist_dir):
+            return 0
+        folder = music_folder_name(root)
+        music_root = os.path.join(root, folder)
+        mapping = {}
+        for old, new in renames.items():
+            old_rel = os.path.relpath(old, music_root).replace(os.sep, "/")
+            new_rel = os.path.relpath(new, music_root).replace(os.sep, "/")
+            mapping[old_rel.lower()] = new_rel
+        marker = "/" + folder.lower() + "/"
+
+        changed = 0
+        for fname in os.listdir(playlist_dir):
+            if not fname.lower().endswith((".m3u", ".m3u8")):
+                continue
+            full = os.path.join(playlist_dir, fname)
+            try:
+                with open(full, "r", encoding="utf-8", newline="") as fh:
+                    lines = fh.readlines()
+            except (OSError, UnicodeDecodeError):
+                continue
+            out = []
+            modified = False
+            for line in lines:
+                body = line.rstrip("\r\n")
+                norm = body.replace("\\", "/")
+                at = norm.lower().find(marker)
+                new_rel = None
+                if at >= 0 and not body.lstrip("\ufeff").startswith("#"):
+                    new_rel = mapping.get(norm[at + len(marker):].lower())
+                if new_rel is None:
+                    out.append(line)
+                    continue
+                out.append(norm[:at + len(marker)] + new_rel
+                           + line[len(body):])
+                modified = True
+            if modified:
+                try:
+                    with open(full, "w", encoding="utf-8", newline="") as fh:
+                        fh.writelines(out)
+                    changed += 1
+                except OSError:
+                    pass
+        return changed
+
+    def _apply_deletions(self, deletions):
+        """Remove what the user un-ticked.
+
+        Runs before any downloads so the space is free for them. Only
+        baseline paths are ever queued, and a track Plex has since renamed
+        is not in the baseline under its old path, so that copy is never
+        deleted here; relocation moves it instead.
         """
         if not deletions:
             return 0

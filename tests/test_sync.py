@@ -304,3 +304,441 @@ class DeviceFullTests(SyncTestCase):
         with mock.patch.object(module, "disk_usage", lambda root: None):
             app._do_sync([("1", {"title": "Mix"})], [], False)
         self.assertEqual(len(self.ipod.basenames()), 3)
+
+
+class _ConvertingAudio(NoAudio):
+    """Reports every FLAC as 24-bit and converts it, recording every path
+    it was asked to read or write."""
+
+    available = True
+
+    def __init__(self):
+        self.touched = []
+
+    def probe(self, path):
+        self.touched.append(path)
+        return {"bit_depth": 24, "sample_rate": 96000}
+
+    def downsample(self, src, dst, timeout=300, sample_rate=None):
+        self.touched += [src, dst]
+        with open(dst, "wb") as fh:
+            fh.write(b"converted")
+        return True, None
+
+
+class StagingTests(SyncTestCase):
+    """Only the finished file may cross USB. Downloading and converting on
+    the iPod writes the full-size file, reads it back and writes again."""
+
+    def test_conversion_never_touches_the_ipod(self):
+        audio = _ConvertingAudio()
+        app = self.build([make_track(1)], audio=audio)
+        self.sync(app, downsample=True)
+        self.assertTrue(audio.touched)
+        for path in audio.touched:
+            self.assertFalse(path.startswith(self.ipod.path), path)
+
+    def test_the_converted_file_is_what_lands(self):
+        app = self.build([make_track(1)], audio=_ConvertingAudio())
+        self.sync(app, downsample=True)
+        [rel] = self.ipod.audio_files()
+        with open(os.path.join(self.ipod.music_dir, rel), "rb") as fh:
+            self.assertEqual(fh.read(), b"converted")
+        self.assertIn("Converted: 24-bit/96 kHz \u2192 16-bit/48 kHz",
+                      "\n".join(app.logs))
+
+    def test_downloads_are_not_written_to_the_ipod(self):
+        app = self.build([make_track(1)])
+        seen = []
+        real = app.plex.download_part
+
+        def spy(part_key, dest_path, **kwargs):
+            seen.append(dest_path)
+            return real(part_key, dest_path, **kwargs)
+
+        app.plex.download_part = spy
+        self.sync(app)
+        self.assertEqual(len(seen), 1)
+        self.assertFalse(seen[0].startswith(self.ipod.path), seen[0])
+        self.assertEqual(len(self.ipod.audio_files()), 1)
+
+    def test_the_plex_size_is_passed_for_the_length_check(self):
+        app = self.build([make_track(1, size=4096)])
+        sizes = []
+        real = app.plex.download_part
+
+        def spy(part_key, dest_path, **kwargs):
+            sizes.append(kwargs.get("expected_size"))
+            return real(part_key, dest_path, **kwargs)
+
+        app.plex.download_part = spy
+        self.sync(app)
+        self.assertEqual(sizes, [4096])
+
+    def test_a_failed_copy_leaves_nothing_on_the_ipod(self):
+        app = self.build([make_track(1)])
+        with mock.patch.object(self.p2i.app.shutil, "copyfile",
+                               side_effect=OSError(28, "No space left")):
+            self.sync(app)
+        leftovers = [f for _d, _s, fs in os.walk(self.ipod.music_dir)
+                     for f in fs]
+        self.assertEqual(leftovers, [])
+        self.assertIn("No space left", "\n".join(app.logs))
+
+    def test_the_staging_folder_is_removed(self):
+        app = self.build([make_track(1), make_track(2)])
+        made = []
+        real = self.p2i.app.tempfile.mkdtemp
+
+        def spy(*a, **k):
+            made.append(real(*a, **k))
+            return made[-1]
+
+        with mock.patch.object(self.p2i.app.tempfile, "mkdtemp", spy):
+            self.sync(app)
+        self.assertEqual(len(made), 1)
+        self.assertFalse(os.path.exists(made[0]))
+
+
+@unittest.skipUnless(__import__("shutil").which("ffmpeg"), "needs ffmpeg")
+class RealDownsampleTests(SyncTestCase):
+    """End to end with the real converter: a 24-bit FLAC served by "Plex"
+    arrives on the iPod as 16-bit."""
+
+    def test_a_24_bit_flac_lands_as_16_bit(self):
+        import shutil, subprocess, tempfile
+        work = tempfile.mkdtemp(prefix="plex2ipod-ffmpeg-")
+        self.addCleanup(shutil.rmtree, work, True)
+        source = os.path.join(work, "source.flac")
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                        "sine=frequency=440:duration=3", "-ar", "96000",
+                        "-sample_fmt", "s32", "-bits_per_raw_sample", "24",
+                        source], check=True)
+
+        app = self.build([make_track(1)],
+                         audio=self.p2i.AudioConverter())
+        self.assertEqual(app.audio.probe(source)["bit_depth"], 24)
+
+        def serve(part_key, dest_path, cancel_check=None, expected_size=0):
+            shutil.copyfile(source, dest_path + ".part")
+            return True, dest_path + ".part"
+
+        app.plex.download_part = serve
+        self.sync(app, downsample=True)
+        [rel] = self.ipod.audio_files()
+        landed = os.path.join(self.ipod.music_dir, rel)
+        self.assertEqual(app.audio.probe(landed),
+                         {"bit_depth": 16, "sample_rate": 48000})
+        self.assertLess(os.path.getsize(landed), os.path.getsize(source) / 2)
+        self.assertIn("24-bit/96 kHz \u2192 16-bit/48 kHz",
+                      "\n".join(app.logs))
+
+    def test_a_16_bit_96k_flac_is_resampled_too(self):
+        import shutil, subprocess, tempfile
+        work = tempfile.mkdtemp(prefix="plex2ipod-ffmpeg-")
+        self.addCleanup(shutil.rmtree, work, True)
+        source = os.path.join(work, "source.flac")
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                        "sine=frequency=440:duration=3", "-ar", "96000",
+                        "-sample_fmt", "s16", source], check=True)
+        app = self.build([make_track(1)], audio=self.p2i.AudioConverter())
+
+        def serve(part_key, dest_path, cancel_check=None, expected_size=0):
+            shutil.copyfile(source, dest_path + ".part")
+            return True, dest_path + ".part"
+
+        app.plex.download_part = serve
+        self.sync(app, downsample=True)
+        [rel] = self.ipod.audio_files()
+        self.assertEqual(
+            app.audio.probe(os.path.join(self.ipod.music_dir, rel)),
+            {"bit_depth": 16, "sample_rate": 48000})
+
+
+RELEASE = "Outkast-Original Album Classics-BOXSET-3CD-FLAC-2011-xpost"
+
+
+class RelocationTests(SyncTestCase):
+    """A track already on the iPod somewhere else is moved into place, not
+    downloaded again. Shaped on a real device: hand-copied scene-release
+    folders that mirror the server's D:\\Music, and Plex renames."""
+
+    def copied_by_hand(self, *parts, size=4096):
+        """Put a file at Music/<parts...> the way a manual copy would."""
+        path = os.path.join(self.ipod.music_dir, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(b"\1" * size)
+        return path
+
+    def release_track(self, n, *folders, size=12345):
+        name = "%02d - Song.flac" % n
+        return make_track(n, artist="OutKast", album="Speakerboxxx",
+                          filename=name, size=size,
+                          server_path="D:/Music/" + "/".join(folders + (name,)))
+
+    def dest(self, track):
+        return os.path.join(self.ipod.music_dir,
+                            *self.p2i.ipod_rel_path(track).split("/"))
+
+    def test_a_hand_copied_release_is_moved_not_downloaded(self):
+        src = self.copied_by_hand(RELEASE, "01 - Song.flac", size=777)
+        track = self.release_track(1, RELEASE)
+        app = self.build([track])
+        self.sync(app)
+        self.assertEqual(app.plex.downloads, 0)
+        self.assertFalse(os.path.exists(src))
+        self.assertEqual(os.path.getsize(self.dest(track)), 777,
+                         "the original bytes, not a fresh download")
+
+    def test_a_multi_disc_release_is_matched_one_level_deeper(self):
+        self.copied_by_hand(RELEASE, "CD1", "01 - Song.flac")
+        track = self.release_track(1, RELEASE, "CD1")
+        app = self.build([track])
+        self.sync(app)
+        self.assertEqual(app.plex.downloads, 0)
+        self.assertTrue(os.path.exists(self.dest(track)))
+
+    def test_a_plex_rename_is_matched_by_name_and_size(self):
+        self.copied_by_hand("OutKast", "Old Album Name", "01 Song.flac",
+                            size=5000)
+        track = make_track(1, artist="OutKast", album="Corrected Name",
+                           filename="01 Song.flac", size=5000)
+        app = self.build([track])
+        self.sync(app)
+        self.assertEqual(app.plex.downloads, 0)
+        self.assertTrue(os.path.exists(self.dest(track)))
+
+    def test_a_different_size_without_a_path_match_is_downloaded(self):
+        self.copied_by_hand("OutKast", "Old Album Name", "01 Song.flac",
+                            size=4999)
+        track = make_track(1, artist="OutKast", album="Corrected Name",
+                           filename="01 Song.flac", size=5000)
+        app = self.build([track])
+        self.sync(app)
+        self.assertEqual(app.plex.downloads, 1)
+
+    def test_two_lookalikes_are_ambiguous_and_neither_is_moved(self):
+        a = self.copied_by_hand("X", "One", "01 Song.flac", size=5000)
+        b = self.copied_by_hand("X", "Two", "01 Song.flac", size=5000)
+        track = make_track(1, artist="OutKast", album="Three",
+                           filename="01 Song.flac", size=5000)
+        app = self.build([track])
+        self.sync(app)
+        self.assertEqual(app.plex.downloads, 1)
+        self.assertTrue(os.path.exists(a) and os.path.exists(b))
+
+    def test_a_file_another_selected_track_owns_is_never_taken(self):
+        owner = make_track(1, artist="A", album="One", filename="x.flac",
+                           size=4096)
+        owned = self.ipod.add_track("A", "One", "x.flac")
+        thief = make_track(2, artist="B", album="Two", filename="x.flac",
+                           size=4096)
+        app = self.build([owner, thief])
+        self.sync(app)
+        self.assertTrue(os.path.exists(owned))
+        self.assertEqual(app.plex.downloads, 1)
+
+    def test_a_file_at_the_music_root_is_not_a_path_match(self):
+        # Folder/filename is the least evidence that counts; a bare name
+        # could be anything.
+        self.copied_by_hand("01 - Song.flac", size=1)
+        track = self.release_track(1, RELEASE)
+        app = self.build([track])
+        self.sync(app)
+        self.assertEqual(app.plex.downloads, 1)
+
+    def test_non_music_files_and_their_folder_are_left_alone(self):
+        self.copied_by_hand(RELEASE, "01 - Song.flac")
+        nfo = self.copied_by_hand(RELEASE, "release.nfo")
+        app = self.build([self.release_track(1, RELEASE)])
+        self.sync(app)
+        self.assertTrue(os.path.exists(nfo))
+
+    def test_an_emptied_release_folder_is_removed(self):
+        self.copied_by_hand(RELEASE, "CD1", "01 - Song.flac")
+        app = self.build([self.release_track(1, RELEASE, "CD1")])
+        self.sync(app)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.ipod.music_dir, RELEASE)))
+
+    def test_the_synced_playlist_lists_the_new_path(self):
+        self.copied_by_hand(RELEASE, "01 - Song.flac")
+        track = self.release_track(1, RELEASE)
+        app = self.build([track])
+        self.sync(app, playlist="Mix")
+        self.assertEqual(self.ipod.m3u_entries("Mix"),
+                         ["/Music/" + self.p2i.ipod_rel_path(track)])
+
+    def test_other_playlists_follow_the_move(self):
+        self.copied_by_hand(RELEASE, "01 - Song.flac")
+        track = self.release_track(1, RELEASE)
+        os.makedirs(self.ipod.playlist_dir, exist_ok=True)
+        rockbox = os.path.join(self.ipod.playlist_dir, "Shuffle.m3u8")
+        with open(rockbox, "wb") as fh:
+            fh.write(("\ufeff/<HDD0>/Music/%s/01 - Song.flac\r\n"
+                      "/<HDD0>/Music/Other/keep.flac\r\n" % RELEASE)
+                     .encode("utf-8"))
+        app_style = self.ipod.write_m3u(
+            "Old", ["/Music/%s/01 - Song.flac" % RELEASE])
+        app = self.build([track])
+        self.sync(app, playlist="Mix")
+
+        new = self.p2i.ipod_rel_path(track)
+        with open(rockbox, "rb") as fh:
+            self.assertEqual(fh.read(), (
+                "\ufeff/<HDD0>/Music/%s\r\n/<HDD0>/Music/Other/keep.flac\r\n"
+                % new).encode("utf-8"), "BOM, prefix and CRLF kept")
+        self.assertEqual(self.ipod.m3u_entries("Old"), ["/Music/" + new])
+
+    def test_the_summary_counts_moves_separately(self):
+        self.copied_by_hand(RELEASE, "01 - Song.flac")
+        app = self.build([self.release_track(1, RELEASE),
+                          make_track(2, artist="Z", album="Z")])
+        self.sync(app)
+        log = "\n".join(app.logs)
+        self.assertIn("1 to download", log)
+        self.assertIn("1 moved into place, no transfer", log)
+        self.assertIn("Done. 1 downloaded, 1 moved, 0 skipped", log)
+
+
+class SyncOrderTests(SyncTestCase):
+    def test_deletions_run_before_downloads(self):
+        app = self.build([make_track(1)])
+        events = []
+        app._apply_deletions = lambda d: events.append("delete") or 0
+        real = app._fetch_track
+
+        def fetch(*a, **k):
+            events.append("download")
+            return real(*a, **k)
+
+        app._fetch_track = fetch
+        self.sync(app)
+        self.assertEqual(events, ["delete", "download"])
+
+    def test_space_freed_by_deletions_is_used_by_the_same_sync(self):
+        # A full iPod: the new track only fits once the old one is gone.
+        old = self.ipod.add_track("Old", "Album", "old.flac", size=8192)
+        app = self.build([make_track(1)])
+        free = {"bytes": 0}
+
+        def usage(_root):
+            return (100000, 100000 - free["bytes"], free["bytes"])
+
+        real_remove = os.remove
+
+        def remove(path):
+            real_remove(path)
+            if path == old:
+                free["bytes"] += 8192 + self.p2i.app.FREE_SPACE_MARGIN
+
+        with mock.patch.object(self.p2i.app, "disk_usage", usage), \
+                mock.patch.object(self.p2i.app.os, "remove", remove):
+            app._do_sync([("1", {"title": "Mix"})], [], False,
+                         ([old], []))
+        self.assertFalse(os.path.exists(old))
+        self.assertEqual(app.plex.downloads, 1)
+        self.assertNotIn("iPod is full", "\n".join(app.logs))
+
+    def test_leftover_part_files_are_cleared(self):
+        leftover = self.ipod.add_track("A", "B", "x.flac.part")
+        tmp = self.ipod.add_track("A", "B", "y.flac.tmp")
+        app = self.build([make_track(1)])
+        self.sync(app)
+        self.assertFalse(os.path.exists(leftover))
+        self.assertFalse(os.path.exists(tmp))
+        self.assertIn("2 leftover temp file", "\n".join(app.logs))
+
+
+class NoEmptyFoldersTests(SyncTestCase):
+    def test_a_failed_download_leaves_no_album_folder(self):
+        track = make_track(1, artist="Ghost", album="Never Arrived")
+        app = self.build([track], fail_keys={track["part_key"]})
+        self.sync(app)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.ipod.music_dir, "Ghost")))
+
+
+class LaptopStorageTests(SyncTestCase):
+    """Each song's local copies are gone the moment it is on the iPod, so
+    a long sync never needs more than one song's worth of laptop space."""
+
+    def watch_staging(self, app):
+        """Record what is left in the staging folder after each track."""
+        leftovers = []
+        real = app._fetch_track
+
+        def fetch(track, dest, downsample, staging):
+            result = real(track, dest, downsample, staging)
+            leftovers.append(sorted(os.listdir(staging)))
+            return result
+
+        app._fetch_track = fetch
+        return leftovers
+
+    def test_nothing_is_left_after_each_song(self):
+        app = self.build([make_track(n) for n in range(3)],
+                         audio=_ConvertingAudio())
+        left = self.watch_staging(app)
+        self.sync(app, downsample=True)
+        self.assertEqual(left, [[], [], []])
+        self.assertEqual(len(self.ipod.audio_files()), 3)
+
+    def test_nothing_is_left_when_a_copy_fails(self):
+        app = self.build([make_track(1)], audio=_ConvertingAudio())
+        left = self.watch_staging(app)
+        with mock.patch.object(self.p2i.app.shutil, "copyfile",
+                               side_effect=OSError(28, "No space left")):
+            self.sync(app, downsample=True)
+        self.assertEqual(left, [[]])
+
+    def test_nothing_is_left_when_a_conversion_fails(self):
+        app = self.build([make_track(1)], audio=FailingAudio())
+        left = self.watch_staging(app)
+        self.sync(app, downsample=True)
+        self.assertEqual(left, [[]])
+
+    def test_staging_is_under_the_cache_folder_not_ram_backed_tmp(self):
+        app = self.build([make_track(1)])
+        seen = []
+        real = app._fetch_track
+
+        def fetch(track, dest, downsample, staging):
+            seen.append(staging)
+            return real(track, dest, downsample, staging)
+
+        app._fetch_track = fetch
+        self.sync(app)
+        self.assertTrue(seen[0].startswith(self.staging_root), seen[0])
+        self.assertEqual(os.listdir(self.staging_root), [],
+                         "the per-sync folder is removed at the end")
+
+    def test_folders_a_crash_left_behind_are_cleared(self):
+        import time
+        stale = os.path.join(self.staging_root, "plex2ipod-old")
+        fresh = os.path.join(self.staging_root, "plex2ipod-busy")
+        for path in (stale, fresh):
+            os.makedirs(path)
+        hour_ago = time.time() - 7200
+        os.utime(stale, (hour_ago, hour_ago))
+        made = self.p2i.App._new_staging()
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.exists(fresh), "another copy may be using it")
+        self.assertTrue(os.path.isdir(made))
+
+
+class StagingRootTests(unittest.TestCase):
+    def test_linux_uses_the_xdg_cache_folder(self):
+        paths = app_module().paths
+        with mock.patch.object(paths.sys, "platform", "linux"), \
+                mock.patch.dict(os.environ, {"XDG_CACHE_HOME": "/c"}):
+            self.assertEqual(paths.staging_root(), "/c/plex2ipod")
+
+    def test_linux_falls_back_to_dot_cache(self):
+        paths = app_module().paths
+        env = {k: v for k, v in os.environ.items() if k != "XDG_CACHE_HOME"}
+        with mock.patch.object(paths.sys, "platform", "linux"), \
+                mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(paths.staging_root(),
+                             os.path.expanduser("~/.cache/plex2ipod"))
