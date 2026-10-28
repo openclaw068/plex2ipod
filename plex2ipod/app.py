@@ -1,6 +1,7 @@
 """The Tk application window and all of its behaviour."""
 
 import os
+import queue
 import shutil
 import subprocess
 import tempfile
@@ -81,6 +82,12 @@ class App:
         self._automounting = False
         self._playlist_track_cache = {}
         self._playlist_fetching = set()
+        # Album and track lists for the library tree are fetched by a few
+        # shared workers. The pre-check opens every artist and album on the
+        # iPod at once, and a thread each meant thousands of requests in
+        # flight, which Plex answers with 503s and slow retries.
+        self._lazy_jobs = queue.Queue()
+        self._lazy_workers = 0
         # Bit depth and sample rate per Plex track, fetched only to estimate
         # what shrinking saves; rating keys asked for so far; fetches out.
         self._track_formats = {}
@@ -2084,17 +2091,31 @@ class App:
             return
         self._tree.delete(children[0])
         if info["type"] == "artist":
-            threading.Thread(
-                target=self._load_albums_worker,
-                args=(item, info["data"], self._ui_generation),
-                daemon=True,
-            ).start()
+            self._queue_lazy_load(self._load_albums_worker, item,
+                                  info["data"], self._ui_generation)
         elif info["type"] == "album":
-            threading.Thread(
-                target=self._load_tracks_worker,
-                args=(item, info["data"], self._ui_generation),
-                daemon=True,
-            ).start()
+            self._queue_lazy_load(self._load_tracks_worker, item,
+                                  info["data"], self._ui_generation)
+
+    LAZY_LOAD_WORKERS = 6
+
+    def _queue_lazy_load(self, worker, *args):
+        self._lazy_jobs.put((worker, args))
+        if self._lazy_workers < self.LAZY_LOAD_WORKERS:
+            self._lazy_workers += 1
+            threading.Thread(target=self._lazy_load_loop,
+                             daemon=True).start()
+
+    def _lazy_load_loop(self):
+        while True:
+            worker, args = self._lazy_jobs.get()
+            # A job queued before a reconnect would only be thrown away.
+            if not self._stale(args[-1]):
+                try:
+                    worker(*args)
+                except Exception as e:   # keep the worker alive
+                    self.root.after(0, self._log_msg,
+                                    f"Failed to load library rows: {e}")
 
     def _lib_select_all(self):
         for item in self._tree.get_children():
